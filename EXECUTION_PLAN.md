@@ -647,6 +647,7 @@ docs/keybindings.md
 | 2026-07-24 | 基础生命周期对齐 | socket 仅在缺失/拒绝连接时启动；错误 force 保留旧 client；新增 `plux stop`；裸命令创建 default；67 项全量测试、Clippy、release build | 已完成 |
 | 2026-07-24 | 回归：鼠标选择高亮实时跟随 | 外层终端和 session 快照启用 `1002` 按键拖动追踪；88 项全量测试、Clippy、release build、伪终端 attach 验证 | 已完成 |
 | 2026-07-24 | 简化会话命令 | `plux [name]` 和 `plux --ssh target [name]` 自动创建、连接和接管；CLI 单测、冷启动/接管回归、双 client PTY smoke test | 已完成 |
+| 2026-07-24 | 回归：SSH 非交互 PATH | SSH bridge 将 `~/.cargo/bin` 加入远端 PATH；命令构造单测、隔离 PATH shell 验证、全量测试 | 已完成 |
 
 ## 16. 审计发现（2026-07-23）
 

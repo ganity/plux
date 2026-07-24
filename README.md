@@ -46,8 +46,9 @@ Remote attach runs the client locally and uses SSH only as an encrypted bridge:
 plux --ssh user@server work
 ```
 
-The server must have a compatible `plux` binary available on `PATH`. Use SSH key
-or agent authentication because automatic reconnect uses non-interactive SSH.
+The server must have a compatible `plux` binary available on `PATH` or installed
+at `~/.cargo/bin/plux`. Use SSH key or agent authentication because automatic
+reconnect uses non-interactive SSH.
 The local client keeps the session alive across SSH interruptions, reconnects
 with the same client identity, and receives a fresh terminal snapshot. Input
 typed while reconnecting is discarded instead of replayed, so commands cannot

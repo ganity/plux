@@ -185,7 +185,7 @@ ssh
   -o ServerAliveCountMax=4
   -o ConnectTimeout=10
   <target>
-  plux __bridge [--start]
+  PATH="$HOME/.cargo/bin:$PATH" exec plux __bridge [--start]
 ```
 
 规则：

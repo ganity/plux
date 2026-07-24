@@ -11,6 +11,7 @@ use crate::{config::Config, error::Result, socket::connect};
 
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const SSH_STDERR_LIMIT: u64 = 8 * 1024;
+const REMOTE_BRIDGE_COMMAND: &str = r#"PATH="$HOME/.cargo/bin:$PATH" exec plux __bridge"#;
 
 pub struct Connection {
     pub reader: Box<dyn Read + Send>,
@@ -41,8 +42,7 @@ impl Connection {
                 "-o",
                 "ConnectTimeout=10",
                 target,
-                "plux",
-                "__bridge",
+                REMOTE_BRIDGE_COMMAND,
             ])
             .args(start.then_some("--start"))
             .stdin(Stdio::piped())
@@ -161,7 +161,15 @@ impl Drop for Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::Connection;
+    use super::{Connection, REMOTE_BRIDGE_COMMAND};
+
+    #[test]
+    fn remote_bridge_finds_cargo_installed_plux() {
+        assert_eq!(
+            REMOTE_BRIDGE_COMMAND,
+            r#"PATH="$HOME/.cargo/bin:$PATH" exec plux __bridge"#
+        );
+    }
 
     #[test]
     fn local_connection_interface_is_available() {
