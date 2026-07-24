@@ -661,8 +661,8 @@ impl Daemon {
                 if let Some(name) = session_name {
                     if let Some(session) = self.sessions.get_mut(&name) {
                         session.resize(rows, cols)?;
+                        self.pending_snapshots.insert(name);
                     }
-                    self.send_snapshot(&name)?;
                 }
                 Ok(())
             }

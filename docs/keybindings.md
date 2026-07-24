@@ -22,6 +22,9 @@ When the focused application does not capture the mouse, left-button dragging
 selects text and copies it on release. In scroll mode, Plux always owns mouse
 selection.
 
+Use the terminal's normal keyboard paste shortcut. When mouse capture is active,
+use Shift with the terminal's right-click paste action to bypass mouse reporting.
+
 | Keys | Action |
 |---|---|
 | Prefix then `d` | Detach |

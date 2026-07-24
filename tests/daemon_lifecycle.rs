@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
@@ -31,13 +31,13 @@ impl TestDaemon {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("plux-test-{}-{suffix}", std::process::id()));
-        let runtime = root.join("runtime");
-        let config = root.join("config");
+        let root = PathBuf::from("/tmp").join(format!("px-{}-{suffix:x}", std::process::id()));
+        let runtime = root.join("r");
+        let config = root.join("c");
         fs::create_dir_all(&runtime).unwrap();
         fs::create_dir_all(&config).unwrap();
 
-        let user = format!("test-{}", std::process::id());
+        let user = format!("t{}", std::process::id());
         let daemon = Command::new(env!("CARGO_BIN_EXE_plux"))
             .arg("__daemon")
             .env("XDG_RUNTIME_DIR", &runtime)
@@ -156,6 +156,45 @@ fn wait_for_detached(stream: &mut UnixStream) {
         }
     }
     panic!("client did not receive Detached");
+}
+
+#[test]
+fn resize_burst_is_coalesced_without_detaching_client() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "resize-burst"]).status.success());
+
+    let mut attached = test.attach("resize-burst");
+    attached
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut burst = Vec::new();
+    for index in 0..256 {
+        let (rows, cols) = if index % 2 == 0 { (24, 80) } else { (3, 10) };
+        write_message(&mut burst, &ClientMessage::Resize { rows, cols }).unwrap();
+    }
+    write_message(&mut burst, &ClientMessage::Heartbeat).unwrap();
+    attached.write_all(&burst).unwrap();
+
+    let mut snapshots = 0;
+    let mut saw_final_size = false;
+    let mut saw_heartbeat = false;
+    while !saw_final_size || !saw_heartbeat {
+        match next_server(&mut attached) {
+            ServerMessage::Snapshot { rows, cols, .. } => {
+                snapshots += 1;
+                saw_final_size |= (rows, cols) == (3, 10);
+            }
+            ServerMessage::HeartbeatAck => saw_heartbeat = true,
+            response => panic!("unexpected resize response: {response:?}"),
+        }
+    }
+    assert!(
+        snapshots <= 4,
+        "resize burst produced {snapshots} snapshots instead of coalescing"
+    );
+
+    write_message(&mut attached, &ClientMessage::Detach).unwrap();
+    wait_for_detached(&mut attached);
 }
 
 #[test]

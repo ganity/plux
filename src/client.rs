@@ -797,6 +797,13 @@ enum InputAction {
     Detach,
 }
 
+fn push_forward(actions: &mut Vec<InputAction>, bytes: &[u8]) {
+    match actions.last_mut() {
+        Some(InputAction::Forward(buffer)) => buffer.extend_from_slice(bytes),
+        _ => actions.push(InputAction::Forward(bytes.to_vec())),
+    }
+}
+
 type Selection = (u16, u16, u16, u16);
 
 struct TerminalView {
@@ -989,7 +996,7 @@ impl InputState {
                 let bytes = &input[index..index + 6];
                 let code = u32::from(bytes[3].saturating_sub(32));
                 if self.mouse_enabled && self.mode != InputMode::Scroll && code & 4 == 0 {
-                    actions.push(InputAction::Forward(bytes.to_vec()));
+                    push_forward(&mut actions, bytes);
                 } else if self.handle_mouse_selection(
                     code,
                     u16::from(bytes[5].saturating_sub(33)),
@@ -999,14 +1006,14 @@ impl InputState {
                 ) {
                 } else if code & 64 != 0 {
                     if self.alternate_screen || !self.scrollback_available {
-                        actions.push(InputAction::Forward(
+                        push_forward(
+                            &mut actions,
                             if code & 1 == 0 {
                                 b"\x1b[5~"
                             } else {
                                 b"\x1b[6~"
-                            }
-                            .to_vec(),
-                        ));
+                            },
+                        );
                     } else {
                         if self.mode != InputMode::Scroll {
                             self.enter_scroll_mode();
@@ -1027,20 +1034,19 @@ impl InputState {
                 match parse_sgr_mouse(&input[index..]) {
                     Some((length, code, col, row, release)) => {
                         if self.mouse_enabled && self.mode != InputMode::Scroll && code & 4 == 0 {
-                            actions
-                                .push(InputAction::Forward(input[index..index + length].to_vec()));
+                            push_forward(&mut actions, &input[index..index + length]);
                         } else if self.handle_mouse_selection(code, row, col, release, &mut actions)
                         {
                         } else if code & 64 != 0 {
                             if self.alternate_screen || !self.scrollback_available {
-                                actions.push(InputAction::Forward(
+                                push_forward(
+                                    &mut actions,
                                     if code & 1 == 0 {
                                         b"\x1b[5~"
                                     } else {
                                         b"\x1b[6~"
-                                    }
-                                    .to_vec(),
-                                ));
+                                    },
+                                );
                             } else {
                                 if self.mode != InputMode::Scroll {
                                     self.enter_scroll_mode();
@@ -1067,7 +1073,7 @@ impl InputState {
             if self.mode == InputMode::Normal {
                 if let Some((length, rows)) = parse_direct_scroll_escape(&input[index..]) {
                     if self.alternate_screen || !self.scrollback_available {
-                        actions.push(InputAction::Forward(input[index..index + length].to_vec()));
+                        push_forward(&mut actions, &input[index..index + length]);
                     } else {
                         self.enter_scroll_mode();
                         actions.push(InputAction::Message(ClientMessage::Scroll { rows }));
@@ -1089,7 +1095,7 @@ impl InputState {
                     self.defer_escape(&input[index..]);
                     break;
                 };
-                actions.push(InputAction::Forward(input[index..index + length].to_vec()));
+                push_forward(&mut actions, &input[index..index + length]);
                 index += length;
                 continue;
             }
@@ -1204,12 +1210,12 @@ impl InputState {
                                 direction: direction.to_string(),
                             }));
                         }
-                        _ => actions.push(InputAction::Forward(vec![self.prefix_byte, byte])),
+                        _ => push_forward(actions, &[self.prefix_byte, byte]),
                     }
                 } else if byte == self.prefix_byte {
                     self.prefix = true;
                 } else {
-                    actions.push(InputAction::Forward(vec![byte]));
+                    push_forward(actions, &[byte]);
                 }
             }
             InputMode::Scroll => self.feed_scroll_byte(byte, actions),
@@ -1576,7 +1582,21 @@ mod tests {
     fn regular_input_is_forwarded() {
         let mut state = InputState::new(24, 80, 0);
         let actions = state.feed(b"echo hi\r");
-        assert_eq!(actions.len(), 8);
+        assert!(matches!(
+            actions.as_slice(),
+            [InputAction::Forward(bytes)] if bytes == b"echo hi\r"
+        ));
+    }
+
+    #[test]
+    fn bracketed_paste_is_forwarded_as_one_input() {
+        let mut state = InputState::new(24, 80, 0);
+        let paste = "\x1b[200~hello 中文\nsecond line\x1b[201~".as_bytes();
+        let actions = state.feed(paste);
+        assert!(matches!(
+            actions.as_slice(),
+            [InputAction::Forward(bytes)] if bytes == paste
+        ));
     }
 
     #[test]
@@ -1862,8 +1882,7 @@ mod tests {
         let actions = state.feed(b"2Zx");
         assert!(matches!(
             actions.as_slice(),
-            [InputAction::Forward(sequence), InputAction::Forward(rest)]
-                if sequence == b"\x1b[1;2Z" && rest == b"x"
+            [InputAction::Forward(bytes)] if bytes == b"\x1b[1;2Zx"
         ));
     }
 

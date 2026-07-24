@@ -651,6 +651,9 @@ docs/keybindings.md
 | 2026-07-24 | 回归：SSH 非交互 PATH | SSH bridge 将 `~/.cargo/bin` 加入远端 PATH；命令构造单测、隔离 PATH shell 验证、全量测试 | 已完成 |
 | 2026-07-24 | 回归：SSH bridge 心跳缓冲 | bridge 每次转发 daemon 输出后立即 flush；长连接 Heartbeat 回归、`ssh jhz@127.0.0.1` 空闲 36 秒及双向命令验证 | 已完成 |
 | 2026-07-24 | GitHub Build Workflow | Linux/macOS x86_64、arm64 原生 runner；93 项 Linux 测试、release 构建和 tar.gz artifact 验证 | 已完成 |
+| 2026-07-24 | 回归：粘贴输入分帧 | 相邻原始输入合并为单个协议帧；中文多行 bracketed paste、真实 PTY 粘贴、94 项全量测试验证 | 已完成 |
+| 2026-07-24 | 回归：macOS daemon 生命周期测试 | 测试 socket 使用短 `/tmp` 路径，避免 macOS `sun_path` 超限；长 `TMPDIR` 复现与回归、94 项全量测试、Clippy、格式检查 | 已完成 |
+| 2026-07-24 | 回归：SSH 窗口缩放断连 | daemon 合并 resize burst，只发送最终尺寸快照；256 次连续 resize 回归、95 项全量测试、Clippy、格式检查、release build | 已完成 |
 
 ## 16. 审计发现（2026-07-23）
 
