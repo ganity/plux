@@ -45,6 +45,7 @@
 | 16 | client 稳定性：断线诊断、状态栏恢复与事件背压 | 已完成 |
 | 17 | 本地 client + SSH bridge：自动重连、连接代际与心跳租约 | 进行中 |
 | 18 | 简化会话入口：自动创建、连接和接管 client | 已完成 |
+| 19 | GitHub Build Workflow：Linux/macOS 双架构构建产物 | 已完成 |
 
 ## 4. 任务 0：仓库和工具链检查
 
@@ -649,6 +650,7 @@ docs/keybindings.md
 | 2026-07-24 | 简化会话命令 | `plux [name]` 和 `plux --ssh target [name]` 自动创建、连接和接管；CLI 单测、冷启动/接管回归、双 client PTY smoke test | 已完成 |
 | 2026-07-24 | 回归：SSH 非交互 PATH | SSH bridge 将 `~/.cargo/bin` 加入远端 PATH；命令构造单测、隔离 PATH shell 验证、全量测试 | 已完成 |
 | 2026-07-24 | 回归：SSH bridge 心跳缓冲 | bridge 每次转发 daemon 输出后立即 flush；长连接 Heartbeat 回归、`ssh jhz@127.0.0.1` 空闲 36 秒及双向命令验证 | 已完成 |
+| 2026-07-24 | GitHub Build Workflow | Linux/macOS x86_64、arm64 原生 runner；93 项 Linux 测试、release 构建和 tar.gz artifact 验证 | 已完成 |
 
 ## 16. 审计发现（2026-07-23）
 
