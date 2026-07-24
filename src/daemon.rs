@@ -361,7 +361,7 @@ impl Daemon {
                     let _ = write_message(
                         &mut stream,
                         &ServerMessage::Error {
-                            message: "another client is already attached; use `plux attach --force <name>` to take over".to_string(),
+                            message: "another client is already attached".to_string(),
                         },
                     );
                 }
@@ -405,7 +405,7 @@ impl Daemon {
                 let _ = write_message(
                     &mut stream,
                     &ServerMessage::Error {
-                        message: "another client is already attached; use `plux attach --force <name>` to take over".to_string(),
+                        message: "another client is already attached".to_string(),
                     },
                 );
             }
@@ -876,7 +876,7 @@ impl Daemon {
     fn validate_attach_target(&self, name: &str) -> Result<()> {
         validate_name(name)?;
         if !self.sessions.contains_key(name) {
-            return Err(format!("session does not exist: {name}; use `plux new {name}`").into());
+            return Err(format!("session does not exist: {name}").into());
         }
         Ok(())
     }
@@ -1024,12 +1024,14 @@ impl Daemon {
         let data = session.render()?;
         let mouse_enabled = session.focused_mouse_enabled();
         let alternate_screen = session.focused_alternate_screen();
+        let scrollback_available = session.focused_scrollback_available();
         let result = self.send(ServerMessage::Snapshot {
             rows,
             cols,
             data,
             mouse_enabled,
             alternate_screen,
+            scrollback_available,
         });
         self.last_snapshot = Instant::now();
         result

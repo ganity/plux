@@ -179,6 +179,12 @@ impl Session {
             .is_some_and(|pane| pane.terminal.screen().alternate_screen())
     }
 
+    pub fn focused_scrollback_available(&mut self) -> bool {
+        self.panes
+            .get_mut(&self.focused)
+            .is_some_and(|pane| pane.terminal.has_scrollback())
+    }
+
     pub fn focused_pane_mut(&mut self) -> Option<&mut Pane> {
         self.panes.get_mut(&self.focused)
     }
@@ -430,9 +436,9 @@ impl Session {
             )?;
         }
         if self.mouse_capture {
-            output.write_all(b"\x1b[?1000h\x1b[?1006h")?;
+            output.write_all(b"\x1b[?1002h\x1b[?1006h")?;
         } else {
-            output.write_all(b"\x1b[?1000l\x1b[?1006l")?;
+            output.write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")?;
         }
         output.write_all(b"\x1b[0m")?;
         self.force_full_render = false;
@@ -474,6 +480,7 @@ mod tests {
         assert!(rendered.contains('|'));
         assert!(!rendered.contains("\x1b[2J"));
         assert!(rendered.contains("\x1b[?25h"));
+        assert!(rendered.contains("\x1b[?1002h"));
         let unchanged = session.render().unwrap();
         assert!(!unchanged.contains("\x1b[H"));
         session

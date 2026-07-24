@@ -3,12 +3,10 @@
 The default prefix is `Ctrl-A`. Configure it with `prefix = "Ctrl-]"` or
 another supported control key.
 
-Use `plux attach --force <name>` to take over a session whose previous SSH
-client is still marked as attached.
-
-Use `plux attach --create <name>` only when the session should be created if it
-does not exist. Plain `attach` never starts a daemon or creates a session.
-Running `plux` without arguments enters or creates the `default` session.
+Use `plux <name>` to enter a session. Plux creates a missing session and
+automatically replaces an older attached client. Running `plux` without a name
+uses the `default` session. For a remote server, use
+`plux --ssh user@server <name>`.
 Use `plux stop` to end the daemon and all of its panes.
 
 ## Normal Mode

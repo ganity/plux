@@ -24,12 +24,7 @@ fn main() -> Result<()> {
 
     let config = Config::load()?;
     match command {
-        Command::Attach {
-            name,
-            force,
-            create,
-            ssh_target,
-        } => client::attach(&config, name, force, create, ssh_target.as_deref())?,
+        Command::Enter { name, ssh_target } => client::enter(&config, name, ssh_target.as_deref())?,
         Command::New { name } => match client::request_or_start(
             &config,
             protocol::ClientMessage::Create {

@@ -99,6 +99,8 @@ pub enum ServerMessage {
         mouse_enabled: bool,
         #[serde(default)]
         alternate_screen: bool,
+        #[serde(default)]
+        scrollback_available: bool,
     },
     Sessions {
         names: Vec<String>,

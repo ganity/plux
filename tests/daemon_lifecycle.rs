@@ -11,6 +11,7 @@ use std::{
 };
 
 use plux::protocol::{read_message, write_message, ClientMessage, ServerMessage};
+use vt100::Parser;
 
 struct TestDaemon {
     root: PathBuf,
@@ -729,5 +730,161 @@ fn scroll_snapshot_replays_full_pty_history() {
     assert!(
         returned_to_bottom,
         "scroll-to-bottom snapshot did not restore latest output"
+    );
+}
+
+#[test]
+fn scrollback_preserves_top_anchored_partial_region_output() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "partial-region-history",
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "for i in $(seq 0 29); do printf 'shell-line-%02d\\n' \"$i\"; done; \
+             printf '\\033[1;20r'; \
+             for i in $(seq 0 59); do printf 'codex-line-%02d\\r\\n' \"$i\"; done; \
+             printf '\\033[r'; \
+             sleep 1"
+                .to_string(),
+        ],
+    );
+
+    let (mut attached, initial_snapshot) = test.attach_with_snapshot("partial-region-history");
+    attached
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut screen = Parser::new(24, 80, 0);
+    screen.process(initial_snapshot.as_bytes());
+
+    let mut saw_latest = screen.screen().contents().contains("codex-line-59");
+    for _ in 0..20 {
+        if saw_latest {
+            break;
+        }
+        match read_message(&mut attached) {
+            Ok(Some(ServerMessage::Snapshot { data, .. })) => {
+                screen.process(data.as_bytes());
+                saw_latest = screen.screen().contents().contains("codex-line-59");
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) => {}
+            Err(error) => panic!("reading partial-region snapshot failed: {error}"),
+        }
+    }
+    assert!(
+        saw_latest,
+        "latest partial-region output did not reach the client"
+    );
+
+    write_message(&mut attached, &ClientMessage::ScrollToTop).unwrap();
+    let mut saw_early_codex_output = false;
+    for _ in 0..10 {
+        match read_message(&mut attached) {
+            Ok(Some(ServerMessage::Snapshot { data, .. })) => {
+                screen.process(data.as_bytes());
+                if screen.screen().contents().contains("codex-line-00") {
+                    saw_early_codex_output = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) => {}
+            Err(error) => panic!("reading partial-region history failed: {error}"),
+        }
+    }
+    assert!(
+        saw_early_codex_output,
+        "scrollback lost output scrolled from a top-anchored partial region"
+    );
+}
+
+#[test]
+fn scrolling_stays_at_history_while_pty_continues_output() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "live-history",
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "for i in $(seq 0 119); do printf 'live-line-%03d\\n' \"$i\"; done; sleep 0.2; for i in $(seq 120 400); do printf 'live-line-%03d\\n' \"$i\"; sleep 0.01; done; sleep 1".to_string(),
+        ],
+    );
+
+    let (mut attached, initial_snapshot) = test.attach_with_snapshot("live-history");
+    attached
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut screen = Parser::new(24, 80, 0);
+    screen.process(initial_snapshot.as_bytes());
+
+    let mut saw_initial_end = screen.screen().contents().contains("live-line-119");
+    for _ in 0..30 {
+        if saw_initial_end {
+            break;
+        }
+        match read_message(&mut attached).unwrap() {
+            Some(ServerMessage::Snapshot { data, .. }) => {
+                screen.process(data.as_bytes());
+                saw_initial_end = screen.screen().contents().contains("live-line-119");
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert!(saw_initial_end, "initial history did not reach the client");
+
+    write_message(&mut attached, &ClientMessage::ScrollToTop).unwrap();
+    let mut saw_top = false;
+    for _ in 0..10 {
+        match read_message(&mut attached).unwrap() {
+            Some(ServerMessage::Snapshot { data, .. }) => {
+                screen.process(data.as_bytes());
+                if screen.screen().contents().contains("live-line-000") {
+                    saw_top = true;
+                    break;
+                }
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert!(saw_top, "scroll-to-top did not show the first history line");
+
+    let mut saw_later_output = false;
+    for _ in 0..20 {
+        match read_message(&mut attached) {
+            Ok(Some(ServerMessage::Snapshot { data, .. })) => {
+                let has_unread_label = data.contains("new lines");
+                screen.process(data.as_bytes());
+                if has_unread_label {
+                    saw_later_output = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) => {}
+            Err(error) => panic!("reading live history snapshot failed: {error}"),
+        }
+    }
+    assert!(
+        saw_later_output,
+        "continued PTY output did not reach the client"
+    );
+    assert!(
+        screen.screen().contents().contains("live-line-000"),
+        "continued PTY output moved the client back to the live screen"
     );
 }

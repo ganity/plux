@@ -21,26 +21,20 @@ macOS `pbcopy` is optional and is used for system clipboard integration.
 ## Use
 
 ```bash
-./target/release/plux
-./target/release/plux new work
-./target/release/plux attach work
-./target/release/plux attach --create work
-./target/release/plux attach --force work
-./target/release/plux attach --ssh user@server work
-./target/release/plux attach --ssh user@server --create work
-./target/release/plux list
-./target/release/plux kill work
-./target/release/plux stop
-./target/release/plux run -- cargo test
+plux
+plux work
+plux --ssh user@server work
+plux list
+plux kill work
+plux stop
+plux run -- cargo test
 ```
 
-Running `plux` without arguments enters or creates the `default` session.
-`new`, `run`, and `attach --create` start a daemon when needed. Explicit
-`attach`, `list`, and `kill` only connect to an existing daemon. Explicit
-`attach` never creates a missing session: use `plux new <name>` or
-`plux attach --create <name>`. `plux stop` cleanly ends the daemon and all of
-its panes. Runtime files are stored below `$XDG_RUNTIME_DIR` when available,
-otherwise below the system temporary directory.
+`plux [name]` enters the named session, creates it when missing, and takes over
+from an older attached client. Without a name it uses `default`. `plux list`
+and `plux kill` only manage existing sessions; `plux stop` cleanly ends the
+daemon and all panes. Runtime files are stored below `$XDG_RUNTIME_DIR` when
+available, otherwise below the system temporary directory.
 
 For a persistent session, attaching after its focused shell exits starts a new
 shell in that pane. Temporary sessions created by `plux run -- ...` are removed
@@ -49,7 +43,7 @@ after their command exits.
 Remote attach runs the client locally and uses SSH only as an encrypted bridge:
 
 ```bash
-plux attach --ssh user@server work
+plux --ssh user@server work
 ```
 
 The server must have a compatible `plux` binary available on `PATH`. Use SSH key
@@ -57,8 +51,8 @@ or agent authentication because automatic reconnect uses non-interactive SSH.
 The local client keeps the session alive across SSH interruptions, reconnects
 with the same client identity, and receives a fresh terminal snapshot. Input
 typed while reconnecting is discarded instead of replayed, so commands cannot
-be executed twice accidentally. `--force` still explicitly takes over a
-session owned by another client.
+be executed twice accidentally. Starting another client for the same session
+automatically replaces the older client.
 
 ## Default Keys
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env,
     fmt::Write as _,
     fs::File,
@@ -29,6 +30,7 @@ use crate::{
 };
 
 const MOUSE_SCROLL_LINES: i32 = 3;
+const MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const CLIENT_EVENT_CAPACITY: usize = 128;
 type ClientWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -51,7 +53,7 @@ fn request_with_stream(mut stream: UnixStream, message: ClientMessage) -> Result
 fn attach_stream(
     config: &Config,
     name: &str,
-    force: bool,
+    takeover: bool,
     rows: u16,
     cols: u16,
     client_token: &str,
@@ -59,13 +61,10 @@ fn attach_stream(
 ) -> Result<Connection> {
     let mut connection = match ssh_target {
         Some(target) => Connection::ssh(target, false)?,
-        None => Connection::local(config).map_err(|error| {
-            format!(
-                "plux daemon is not running or unavailable ({error}); use `plux attach --create {name}` to create a session"
-            )
-        })?,
+        None => Connection::local(config)
+            .map_err(|error| format!("plux daemon is not running or unavailable: {error}"))?,
     };
-    let message = if force {
+    let message = if takeover {
         ClientMessage::Takeover {
             name: name.to_string(),
             rows,
@@ -117,36 +116,28 @@ fn connection_failure(connection: &mut Connection, message: impl Into<String>) -
     }
 }
 
-pub fn attach(
-    config: &Config,
-    name: String,
-    force: bool,
-    create: bool,
-    ssh_target: Option<&str>,
-) -> Result<()> {
+pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<()> {
     let prefix_byte = config.prefix_byte()?;
     let (mut cols, mut rows) = terminal_size()?;
-    if create {
-        match ssh_target {
-            Some(target) => create_session_if_missing_ssh(target, &name, rows, cols)?,
-            None => create_session_if_missing(config, &name, rows, cols)?,
-        }
+    match ssh_target {
+        Some(target) => create_session_if_missing_ssh(target, &name, rows, cols)?,
+        None => create_session_if_missing(config, &name, rows, cols)?,
     }
     let client_token = generate_client_token()?;
-    let mut connection =
-        attach_stream(config, &name, force, rows, cols, &client_token, ssh_target)?;
+    let mut connection = attach_stream(config, &name, true, rows, cols, &client_token, ssh_target)?;
     let mut writer = connection.writer.clone();
-    let (events_tx, events_rx) = mpsc::sync_channel(CLIENT_EVENT_CAPACITY);
+    let (input_events_tx, input_events_rx) = mpsc::sync_channel(CLIENT_EVENT_CAPACITY);
+    let (server_events_tx, server_events_rx) = mpsc::sync_channel(CLIENT_EVENT_CAPACITY);
     let mut connection_generation = 1;
     spawn_server_reader(
         connection.take_reader(),
-        events_tx.clone(),
+        server_events_tx.clone(),
         connection_generation,
     );
 
     let _guard = TerminalGuard::enter(config.mouse)?;
-    spawn_stdin_reader(events_tx.clone());
-    spawn_signal_reader(events_tx.clone());
+    spawn_stdin_reader(input_events_tx.clone());
+    spawn_signal_reader(input_events_tx.clone());
 
     let mut stdout = io::stdout();
     let mut input = InputState::new(rows, cols, prefix_byte);
@@ -157,6 +148,7 @@ pub fn attach(
     let mut reconnect_backoff = Duration::from_millis(500);
     let mut last_heartbeat_sent = Instant::now();
     let mut last_heartbeat_ack = Instant::now();
+    let mut pending_server_events = VecDeque::new();
     loop {
         let (next_cols, next_rows) = terminal_size()?;
         if (next_rows, next_cols) != (rows, cols) {
@@ -223,13 +215,13 @@ pub fn attach(
         } else if !waiting_snapshot && now >= next_reconnect {
             connection.close();
             draw_connection_status(&mut stdout, rows, "reconnecting...")?;
-            match attach_stream(config, &name, force, rows, cols, &client_token, ssh_target) {
+            match attach_stream(config, &name, false, rows, cols, &client_token, ssh_target) {
                 Ok(mut new_connection) => {
                     connection_generation += 1;
                     writer = new_connection.writer.clone();
                     spawn_server_reader(
                         new_connection.take_reader(),
-                        events_tx.clone(),
+                        server_events_tx.clone(),
                         connection_generation,
                     );
                     connection = new_connection;
@@ -243,13 +235,17 @@ pub fn attach(
                     )?;
                 }
                 Err(error) => {
-                    if !is_retryable_reconnect_error(&error.to_string()) {
+                    let message = error.to_string();
+                    if message.contains("another client is already attached") {
+                        return Ok(());
+                    }
+                    if !is_retryable_reconnect_error(&message) {
                         return Err(error);
                     }
                     draw_connection_status(
                         &mut stdout,
                         rows,
-                        &format!("reconnect failed: {error}"),
+                        &format!("reconnect failed: {message}"),
                     )?;
                     next_reconnect = now + reconnect_backoff;
                     reconnect_backoff = (reconnect_backoff * 2).min(Duration::from_secs(5));
@@ -266,7 +262,11 @@ pub fn attach(
             draw_connection_status(&mut stdout, rows, "snapshot timeout; reconnecting")?;
         }
 
-        match events_rx.recv_timeout(Duration::from_millis(50)) {
+        match receive_client_event(
+            &input_events_rx,
+            &server_events_rx,
+            &mut pending_server_events,
+        ) {
             Ok(ClientEvent::Input(bytes)) => {
                 if !connected {
                     if bytes.contains(&0x1b) {
@@ -404,10 +404,12 @@ fn handle_server_message(
             data,
             mouse_enabled,
             alternate_screen,
+            scrollback_available,
         } => {
             input.set_size(rows, cols);
             input.set_mouse_enabled(mouse_enabled);
             input.set_alternate_screen(alternate_screen);
+            input.set_scrollback_available(scrollback_available);
             view.set_size(rows, cols);
             view.process(&data);
             stdout.write_all(data.replace("\x1b[2J", "").as_bytes())?;
@@ -527,7 +529,7 @@ pub fn run(config: &Config, command: Vec<String>) -> Result<()> {
         ServerMessage::Error { message } => return Err(message.into()),
         response => return Err(format!("unexpected run response: {response:?}").into()),
     }
-    let result = attach(config, name.clone(), false, false, None);
+    let result = enter(config, name.clone(), None);
     let _ = request(config, ClientMessage::Kill { name });
     result
 }
@@ -634,6 +636,49 @@ fn send(writer: &ClientWriter, message: &ClientMessage) -> Result<()> {
     write_message(&mut *writer, message)
 }
 
+fn receive_client_event(
+    input_events: &mpsc::Receiver<ClientEvent>,
+    server_events: &mpsc::Receiver<ClientEvent>,
+    pending_server_events: &mut VecDeque<ClientEvent>,
+) -> std::result::Result<ClientEvent, mpsc::RecvTimeoutError> {
+    match input_events.try_recv() {
+        Ok(event) => return Ok(event),
+        Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvTimeoutError::Disconnected),
+        Err(mpsc::TryRecvError::Empty) => {}
+    }
+    if let Some(event) = pending_server_events.pop_front() {
+        return Ok(event);
+    }
+
+    let event = server_events.recv_timeout(Duration::from_millis(10))?;
+    let Some(generation) = snapshot_generation(&event) else {
+        return Ok(event);
+    };
+
+    let mut latest = event;
+    loop {
+        match server_events.try_recv() {
+            Ok(next) if snapshot_generation(&next) == Some(generation) => latest = next,
+            Ok(next) => {
+                pending_server_events.push_back(next);
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+    Ok(latest)
+}
+
+fn snapshot_generation(event: &ClientEvent) -> Option<u64> {
+    match event {
+        ClientEvent::Server {
+            generation,
+            message: ServerMessage::Snapshot { .. },
+        } => Some(*generation),
+        _ => None,
+    }
+}
+
 fn spawn_server_reader<R: Read + Send + 'static>(
     mut reader: R,
     events: mpsc::SyncSender<ClientEvent>,
@@ -727,6 +772,7 @@ struct InputState {
     escape_started: Option<Instant>,
     mouse_enabled: bool,
     alternate_screen: bool,
+    scrollback_available: bool,
     rows: u16,
     cols: u16,
     cursor_row: u16,
@@ -875,6 +921,7 @@ impl InputState {
             escape_started: None,
             mouse_enabled: false,
             alternate_screen: false,
+            scrollback_available: true,
             rows,
             cols,
             cursor_row: rows.saturating_sub(1),
@@ -899,6 +946,10 @@ impl InputState {
 
     fn set_alternate_screen(&mut self, enabled: bool) {
         self.alternate_screen = enabled;
+    }
+
+    fn set_scrollback_available(&mut self, available: bool) {
+        self.scrollback_available = available;
     }
 
     fn selection_coordinates_if_active(&self) -> Option<Selection> {
@@ -947,7 +998,7 @@ impl InputState {
                     &mut actions,
                 ) {
                 } else if code & 64 != 0 {
-                    if self.alternate_screen && self.mode != InputMode::Scroll {
+                    if self.alternate_screen || !self.scrollback_available {
                         actions.push(InputAction::Forward(
                             if code & 1 == 0 {
                                 b"\x1b[5~"
@@ -981,7 +1032,7 @@ impl InputState {
                         } else if self.handle_mouse_selection(code, row, col, release, &mut actions)
                         {
                         } else if code & 64 != 0 {
-                            if self.alternate_screen && self.mode != InputMode::Scroll {
+                            if self.alternate_screen || !self.scrollback_available {
                                 actions.push(InputAction::Forward(
                                     if code & 1 == 0 {
                                         b"\x1b[5~"
@@ -1015,7 +1066,7 @@ impl InputState {
             }
             if self.mode == InputMode::Normal {
                 if let Some((length, rows)) = parse_direct_scroll_escape(&input[index..]) {
-                    if self.alternate_screen {
+                    if self.alternate_screen || !self.scrollback_available {
                         actions.push(InputAction::Forward(input[index..index + length].to_vec()));
                     } else {
                         self.enter_scroll_mode();
@@ -1486,7 +1537,7 @@ impl TerminalGuard {
             return Err(error.into());
         }
         if mouse {
-            stdout.write_all(b"\x1b[?1000h\x1b[?1006h")?;
+            stdout.write_all(MOUSE_CAPTURE_ENABLE)?;
             stdout.flush()?;
         }
         Ok(Self)
@@ -1506,12 +1557,13 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::net::UnixStream, sync::mpsc, time::Duration};
+    use std::{collections::VecDeque, os::unix::net::UnixStream, sync::mpsc, time::Duration};
 
     use super::{
         draw_input_status, spawn_server_reader, ClientEvent, InputAction, InputState, TerminalView,
+        MOUSE_CAPTURE_ENABLE,
     };
-    use crate::protocol::ClientMessage;
+    use crate::protocol::{ClientMessage, ServerMessage};
 
     #[test]
     fn prefix_detaches_without_forwarding() {
@@ -1525,6 +1577,13 @@ mod tests {
         let mut state = InputState::new(24, 80, 0);
         let actions = state.feed(b"echo hi\r");
         assert_eq!(actions.len(), 8);
+    }
+
+    #[test]
+    fn mouse_capture_reports_motion_while_dragging() {
+        assert!(MOUSE_CAPTURE_ENABLE
+            .windows(b"\x1b[?1002h".len())
+            .any(|window| window == b"\x1b[?1002h"));
     }
 
     #[test]
@@ -1575,6 +1634,61 @@ mod tests {
         assert!(matches!(
             events_rx.recv_timeout(Duration::from_secs(1)),
             Ok(ClientEvent::ServerClosed { .. })
+        ));
+    }
+
+    #[test]
+    fn input_is_prioritized_over_backlogged_server_snapshot() {
+        let (input_tx, input_rx) = mpsc::sync_channel(4);
+        let (server_tx, server_rx) = mpsc::sync_channel(4);
+        server_tx
+            .send(ClientEvent::Server {
+                generation: 1,
+                message: ServerMessage::Snapshot {
+                    rows: 2,
+                    cols: 4,
+                    data: String::new(),
+                    mouse_enabled: false,
+                    alternate_screen: false,
+                    scrollback_available: true,
+                },
+            })
+            .unwrap();
+        input_tx
+            .send(ClientEvent::Input(b"mouse-motion".to_vec()))
+            .unwrap();
+
+        assert!(matches!(
+            super::receive_client_event(&input_rx, &server_rx, &mut VecDeque::new()),
+            Ok(ClientEvent::Input(bytes)) if bytes == b"mouse-motion"
+        ));
+    }
+
+    #[test]
+    fn latest_server_snapshot_replaces_stale_snapshots() {
+        let (_input_tx, input_rx) = mpsc::sync_channel(4);
+        let (server_tx, server_rx) = mpsc::sync_channel(4);
+        for data in ["old", "new"] {
+            server_tx
+                .send(ClientEvent::Server {
+                    generation: 1,
+                    message: ServerMessage::Snapshot {
+                        rows: 2,
+                        cols: 4,
+                        data: data.to_string(),
+                        mouse_enabled: false,
+                        alternate_screen: false,
+                        scrollback_available: true,
+                    },
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            super::receive_client_event(&input_rx, &server_rx, &mut VecDeque::new()),
+            Ok(ClientEvent::Server {
+                message: ServerMessage::Snapshot { data, .. },
+                ..
+            }) if data == "new"
         ));
     }
 
@@ -1633,12 +1747,25 @@ mod tests {
     #[test]
     fn page_up_enters_scroll_mode_directly() {
         let mut state = InputState::new(24, 80, 0);
+        state.scrollback_available = true;
         let actions = state.feed(b"\x1b[5~");
         assert!(matches!(
             actions.as_slice(),
             [InputAction::Message(ClientMessage::Scroll { rows: 10 })]
         ));
         assert!(matches!(state.mode, super::InputMode::Scroll));
+    }
+
+    #[test]
+    fn page_up_is_forwarded_when_scrollback_is_unavailable() {
+        let mut state = InputState::new(24, 80, 0);
+        state.scrollback_available = false;
+
+        assert!(matches!(
+            state.feed(b"\x1b[5~").as_slice(),
+            [InputAction::Forward(bytes)] if bytes == b"\x1b[5~"
+        ));
+        assert!(matches!(state.mode, super::InputMode::Normal));
     }
 
     #[test]
@@ -1654,9 +1781,25 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_maps_to_page_keys_in_alternate_screen() {
+    fn mouse_wheel_is_forwarded_in_alternate_screen() {
         let mut state = InputState::new(24, 80, 0);
         state.set_alternate_screen(true);
+        state.set_mouse_enabled(true);
+        assert!(matches!(
+            state.feed(b"\x1b[<64;10;5M").as_slice(),
+            [InputAction::Forward(bytes)] if bytes == b"\x1b[<64;10;5M"
+        ));
+        assert!(matches!(
+            state.feed(b"\x1b[Ma**").as_slice(),
+            [InputAction::Forward(bytes)] if bytes == b"\x1b[Ma**"
+        ));
+        assert!(matches!(state.mode, super::InputMode::Normal));
+    }
+
+    #[test]
+    fn mouse_wheel_is_forwarded_as_page_key_without_scrollback() {
+        let mut state = InputState::new(24, 80, 0);
+        state.scrollback_available = false;
         assert!(matches!(
             state.feed(b"\x1b[<64;10;5M").as_slice(),
             [InputAction::Forward(bytes)] if bytes == b"\x1b[5~"
@@ -1698,6 +1841,7 @@ mod tests {
         assert_eq!(state.selection_anchor, Some((1, 2)));
 
         assert!(state.feed(b"\x1b[<32;6;2M").is_empty());
+        assert_eq!(state.selection_coordinates_if_active(), Some((1, 2, 1, 6)));
         let actions = state.feed(b"\x1b[<0;6;2m");
         assert!(matches!(
             actions.as_slice(),

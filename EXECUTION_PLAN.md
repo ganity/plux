@@ -44,6 +44,7 @@
 | 15 | 基础生命周期对齐：安全启动、接管预检与停止 daemon | 已完成 |
 | 16 | client 稳定性：断线诊断、状态栏恢复与事件背压 | 已完成 |
 | 17 | 本地 client + SSH bridge：自动重连、连接代际与心跳租约 | 进行中 |
+| 18 | 简化会话入口：自动创建、连接和接管 client | 已完成 |
 
 ## 4. 任务 0：仓库和工具链检查
 
@@ -644,6 +645,8 @@ docs/keybindings.md
 | 2026-07-23 | 终端稳定性专项审计 | 非法 takeover、最终输出顺序、分屏 pane 退出和 alternate-screen 滚轮路由均已修复；62 项全量测试、Clippy、release build | 已完成 |
 | 2026-07-24 | attach 语义对齐 | 普通 attach/list/kill 不启动 daemon；`attach --create` 显式创建；移除会泄漏 daemon 的冷启动测试；64 项全量测试、Clippy、release build | 已完成 |
 | 2026-07-24 | 基础生命周期对齐 | socket 仅在缺失/拒绝连接时启动；错误 force 保留旧 client；新增 `plux stop`；裸命令创建 default；67 项全量测试、Clippy、release build | 已完成 |
+| 2026-07-24 | 回归：鼠标选择高亮实时跟随 | 外层终端和 session 快照启用 `1002` 按键拖动追踪；88 项全量测试、Clippy、release build、伪终端 attach 验证 | 已完成 |
+| 2026-07-24 | 简化会话命令 | `plux [name]` 和 `plux --ssh target [name]` 自动创建、连接和接管；CLI 单测、冷启动/接管回归、双 client PTY smoke test | 已完成 |
 
 ## 16. 审计发现（2026-07-23）
 

@@ -58,6 +58,14 @@ impl TerminalState {
         self.parser.screen().scrollback() > 0
     }
 
+    pub fn has_scrollback(&mut self) -> bool {
+        let original = self.parser.screen().scrollback();
+        self.set_scrollback(usize::MAX);
+        let available = self.parser.screen().scrollback() > 0;
+        self.set_scrollback(original);
+        available
+    }
+
     #[cfg(test)]
     pub fn search(&mut self, query: &str, direction: i8) -> bool {
         if query.is_empty() {
@@ -175,6 +183,7 @@ mod tests {
         terminal.process(b"one\ntwo\nthree\nfour\n");
         terminal.set_scrollback(1);
         assert_eq!(terminal.screen().scrollback(), 1);
+        assert!(terminal.has_scrollback());
     }
 
     #[test]
@@ -192,6 +201,33 @@ mod tests {
 
         terminal.scroll_to_top();
         assert!(terminal.contents().contains("line-0"));
+    }
+
+    #[test]
+    fn preserves_scrollback_for_top_anchored_partial_region() {
+        let mut terminal = TerminalState::with_limits(5, 40, 20, usize::MAX);
+        terminal.process(b"\x1b[1;3rfirst-1\r\nfirst-2\r\nfirst-3\r\nsecond-1\r\nsecond-2");
+
+        terminal.scroll_to_top();
+        assert!(terminal.contents().contains("first-1"));
+    }
+
+    #[test]
+    fn excludes_non_top_partial_region_from_scrollback() {
+        let mut terminal = TerminalState::with_limits(5, 40, 20, usize::MAX);
+        terminal.process(b"\x1b[2;4r\x1b[2;1Hfirst\r\nsecond\r\nthird\r\nfourth");
+
+        assert!(!terminal.has_scrollback());
+        assert!(!terminal.contents().contains("first"));
+    }
+
+    #[test]
+    fn preserves_lines_deleted_from_top_anchored_region() {
+        let mut terminal = TerminalState::with_limits(5, 40, 20, usize::MAX);
+        terminal.process(b"\x1b[1;3rfirst\r\nsecond\r\nthird\x1b[1;1H\x1b[M");
+
+        terminal.scroll_to_top();
+        assert!(terminal.contents().contains("first"));
     }
 
     #[test]

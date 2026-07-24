@@ -4,10 +4,8 @@ use crate::error::Result;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    Attach {
+    Enter {
         name: String,
-        force: bool,
-        create: bool,
         ssh_target: Option<String>,
     },
     New {
@@ -29,24 +27,26 @@ pub enum Command {
 }
 
 pub fn parse() -> Result<Command> {
-    let mut args = env::args().skip(1);
-    let Some(command) = args.next() else {
-        return Ok(Command::Attach {
+    parse_args(env::args().skip(1).collect())
+}
+
+fn parse_args(args: Vec<String>) -> Result<Command> {
+    let Some(command) = args.first() else {
+        return Ok(Command::Enter {
             name: "default".to_string(),
-            force: false,
-            create: true,
             ssh_target: None,
         });
     };
+    let mut rest = args[1..].iter().cloned();
 
     match command.as_str() {
         "-h" | "--help" | "help" => Ok(Command::Help),
         "__daemon" => Ok(Command::Daemon),
         "__bridge" => {
-            let start = match args.next().as_deref() {
+            let start = match rest.next().as_deref() {
                 None => false,
                 Some("--start") => {
-                    if args.next().is_some() {
+                    if rest.next().is_some() {
                         return Err("unexpected __bridge argument".into());
                     }
                     true
@@ -58,38 +58,16 @@ pub fn parse() -> Result<Command> {
             Ok(Command::Bridge { start })
         }
         "new" => Ok(Command::New {
-            name: args.next().unwrap_or_else(|| "default".to_string()),
+            name: rest.next().unwrap_or_else(|| "default".to_string()),
         }),
-        "attach" => {
-            let mut name = None;
-            let mut force = false;
-            let mut create = false;
-            let mut ssh_target = None;
-            while let Some(argument) = args.next() {
-                match argument.as_str() {
-                    "-f" | "--force" => force = true,
-                    "-c" | "--create" => create = true,
-                    "--ssh" => {
-                        ssh_target = Some(args.next().ok_or("--ssh requires a target")?);
-                    }
-                    _ if name.is_none() => name = Some(argument),
-                    _ => return Err(format!("unexpected attach argument: {argument}").into()),
-                }
-            }
-            Ok(Command::Attach {
-                name: name.unwrap_or_else(|| "default".to_string()),
-                force,
-                create,
-                ssh_target,
-            })
-        }
+        "attach" => parse_enter(rest, true),
         "list" | "ls" => Ok(Command::List),
         "kill" => Ok(Command::Kill {
-            name: args.next().unwrap_or_else(|| "default".to_string()),
+            name: rest.next().unwrap_or_else(|| "default".to_string()),
         }),
         "stop" | "kill-server" => Ok(Command::Stop),
         "run" => {
-            let command = args.collect::<Vec<_>>();
+            let command = rest.collect::<Vec<_>>();
             let command = command
                 .strip_prefix(&["--".to_string()])
                 .unwrap_or(&command)
@@ -99,17 +77,77 @@ pub fn parse() -> Result<Command> {
             }
             Ok(Command::Run { command })
         }
-        unknown => Err(format!("unknown command: {unknown}\n\n{}", usage()).into()),
+        option if option.starts_with('-') => parse_enter(args.into_iter(), false),
+        name if rest.next().is_none() => Ok(Command::Enter {
+            name: name.to_string(),
+            ssh_target: None,
+        }),
+        name => Err(format!("unexpected argument after session name: {name}").into()),
     }
 }
 
+fn parse_enter(args: impl Iterator<Item = String>, legacy: bool) -> Result<Command> {
+    let mut args = args.peekable();
+    let mut name = None;
+    let mut ssh_target = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--ssh" => ssh_target = Some(args.next().ok_or("--ssh requires a target")?),
+            "-f" | "--force" | "-c" | "--create" if legacy => {}
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option: {option}").into())
+            }
+            _ if name.is_none() => name = Some(argument),
+            _ => return Err(format!("unexpected session argument: {argument}").into()),
+        }
+    }
+    Ok(Command::Enter {
+        name: name.unwrap_or_else(|| "default".to_string()),
+        ssh_target,
+    })
+}
+
 pub fn usage() -> &'static str {
-    "Usage:\n  plux [attach <name>]\n  plux new [<name>]\n  plux attach [--create] [--force] [--ssh <target>] [<name>]\n  plux list\n  plux kill [<name>]\n  plux stop\n  plux run -- <command> [args...]\n  plux --help"
+    "Usage:\n  plux [<name>]\n  plux --ssh <target> [<name>]\n  plux list\n  plux kill [<name>]\n  plux stop\n  plux run -- <command> [args...]\n  plux --help"
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Command;
+    use super::{parse_args, Command};
+
+    fn parse(args: &[&str]) -> Command {
+        parse_args(args.iter().map(|argument| argument.to_string()).collect()).unwrap()
+    }
+
+    #[test]
+    fn session_name_enters_with_automatic_lifecycle() {
+        assert_eq!(
+            parse(&["work"]),
+            Command::Enter {
+                name: "work".to_string(),
+                ssh_target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ssh_target_is_a_top_level_option() {
+        assert_eq!(
+            parse(&["--ssh", "user@server", "work"]),
+            Command::Enter {
+                name: "work".to_string(),
+                ssh_target: Some("user@server".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_attach_flags_remain_compatible() {
+        assert_eq!(
+            parse(&["attach", "--create", "--force", "work"]),
+            parse(&["work"])
+        );
+    }
 
     #[test]
     fn run_strips_separator() {
