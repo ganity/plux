@@ -6,6 +6,7 @@ use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -326,6 +327,70 @@ fn bridge_forwards_protocol_without_extra_output() {
     assert!(matches!(
         next_server(&mut stdout),
         ServerMessage::Sessions { names } if names.is_empty()
+    ));
+    drop(stdin);
+    assert!(bridge.wait().unwrap().success());
+}
+
+#[test]
+fn bridge_keeps_forwarding_after_interactive_attach() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "work"]).status.success());
+    thread::sleep(Duration::from_millis(100));
+    let mut bridge = Command::new(env!("CARGO_BIN_EXE_plux"))
+        .arg("__bridge")
+        .env("XDG_RUNTIME_DIR", &test.runtime)
+        .env("XDG_CONFIG_HOME", &test.config)
+        .env("USER", &test.user)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = bridge.stdin.take().unwrap();
+    let mut stdout = bridge.stdout.take().unwrap();
+    let (messages_tx, messages_rx) = mpsc::channel();
+    thread::spawn(move || {
+        while let Ok(Some(message)) = read_message(&mut stdout) {
+            if messages_tx.send(message).is_err() {
+                return;
+            }
+        }
+    });
+
+    write_message(
+        &mut stdin,
+        &ClientMessage::Takeover {
+            name: "work".to_string(),
+            rows: 24,
+            cols: 80,
+            client_token: FIRST_CLIENT_TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    let attached = messages_rx.recv_timeout(Duration::from_secs(5));
+    assert!(
+        matches!(attached, Ok(ServerMessage::Attached { .. })),
+        "bridge did not attach: {attached:?}"
+    );
+    let snapshot = messages_rx.recv_timeout(Duration::from_secs(5));
+    assert!(
+        matches!(snapshot, Ok(ServerMessage::Snapshot { .. })),
+        "bridge did not forward snapshot: {snapshot:?}"
+    );
+
+    write_message(&mut stdin, &ClientMessage::Heartbeat).unwrap();
+    let heartbeat = messages_rx.recv_timeout(Duration::from_secs(1));
+    if !matches!(heartbeat, Ok(ServerMessage::HeartbeatAck)) {
+        let _ = bridge.kill();
+        let _ = bridge.wait();
+        panic!("bridge did not forward heartbeat: {heartbeat:?}");
+    }
+
+    write_message(&mut stdin, &ClientMessage::Detach).unwrap();
+    assert!(matches!(
+        messages_rx.recv_timeout(Duration::from_secs(1)),
+        Ok(ServerMessage::Detached)
     ));
     drop(stdin);
     assert!(bridge.wait().unwrap().success());

@@ -147,7 +147,18 @@ pub fn bridge(config: &Config, start: bool) -> Result<()> {
             let mut stdin = io::stdin().lock();
             let _ = io::copy(&mut stdin, &mut socket_writer);
         })?;
-    let result = io::copy(&mut socket_reader, &mut io::stdout().lock());
+    let mut stdout = io::stdout().lock();
+    let mut buffer = [0_u8; 8 * 1024];
+    let result = loop {
+        match socket_reader.read(&mut buffer) {
+            Ok(0) => break Ok(()),
+            Ok(size) => {
+                stdout.write_all(&buffer[..size])?;
+                stdout.flush()?;
+            }
+            Err(error) => break Err(error),
+        }
+    };
     drop(stdin_thread);
     result?;
     Ok(())
