@@ -1,0 +1,733 @@
+#![cfg(unix)]
+
+use std::{
+    fs,
+    io::Read,
+    os::unix::net::UnixStream,
+    path::PathBuf,
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use plux::protocol::{read_message, write_message, ClientMessage, ServerMessage};
+
+struct TestDaemon {
+    root: PathBuf,
+    runtime: PathBuf,
+    config: PathBuf,
+    user: String,
+    daemon: Child,
+}
+
+const FIRST_CLIENT_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+const SECOND_CLIENT_TOKEN: &str = "fedcba9876543210fedcba9876543210";
+
+impl TestDaemon {
+    fn start() -> Self {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("plux-test-{}-{suffix}", std::process::id()));
+        let runtime = root.join("runtime");
+        let config = root.join("config");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir_all(&config).unwrap();
+
+        let user = format!("test-{}", std::process::id());
+        let daemon = Command::new(env!("CARGO_BIN_EXE_plux"))
+            .arg("__daemon")
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("USER", &user)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let test = Self {
+            root,
+            runtime,
+            config,
+            user,
+            daemon,
+        };
+        test.wait_for_socket();
+        test
+    }
+
+    fn socket_path(&self) -> PathBuf {
+        self.runtime
+            .join(format!("plux-{}", self.user))
+            .join("plux.sock")
+    }
+
+    fn wait_for_socket(&self) {
+        for _ in 0..100 {
+            if UnixStream::connect(self.socket_path()).is_ok() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("daemon socket did not become ready");
+    }
+
+    fn cli(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_plux"))
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env("XDG_CONFIG_HOME", &self.config)
+            .env("USER", &self.user)
+            .output()
+            .unwrap()
+    }
+
+    fn create_with_command(&self, name: &str, command: Vec<String>) {
+        let mut stream = UnixStream::connect(self.socket_path()).unwrap();
+        write_message(
+            &mut stream,
+            &ClientMessage::Create {
+                name: name.to_string(),
+                rows: 24,
+                cols: 80,
+                command: Some(command),
+                temporary: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            next_server(&mut stream),
+            ServerMessage::Created { .. }
+        ));
+    }
+
+    fn attach(&self, name: &str) -> UnixStream {
+        self.attach_with_token(name, FIRST_CLIENT_TOKEN).0
+    }
+
+    fn attach_with_snapshot(&self, name: &str) -> (UnixStream, String) {
+        self.attach_with_token(name, FIRST_CLIENT_TOKEN)
+    }
+
+    fn attach_with_token(&self, name: &str, client_token: &str) -> (UnixStream, String) {
+        let mut stream = UnixStream::connect(self.socket_path()).unwrap();
+        write_message(
+            &mut stream,
+            &ClientMessage::Attach {
+                name: name.to_string(),
+                rows: 24,
+                cols: 80,
+                client_token: client_token.to_string(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            next_server(&mut stream),
+            ServerMessage::Attached { .. }
+        ));
+        let snapshot = match next_server(&mut stream) {
+            ServerMessage::Snapshot { data, .. } => data,
+            response => panic!("expected initial snapshot, got {response:?}"),
+        };
+        (stream, snapshot)
+    }
+}
+
+impl Drop for TestDaemon {
+    fn drop(&mut self) {
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn next_server<R: Read>(stream: &mut R) -> ServerMessage {
+    read_message(stream).unwrap().unwrap()
+}
+
+fn wait_for_detached(stream: &mut UnixStream) {
+    for _ in 0..20 {
+        if matches!(next_server(stream), ServerMessage::Detached) {
+            return;
+        }
+    }
+    panic!("client did not receive Detached");
+}
+
+#[test]
+fn disconnected_competing_client_does_not_kill_daemon() {
+    let test = TestDaemon::start();
+    let created = test.cli(&["new", "stable"]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let mut attached = test.attach("stable");
+    let competing = UnixStream::connect(test.socket_path()).unwrap();
+    drop(competing);
+    thread::sleep(Duration::from_millis(250));
+
+    let list_while_attached = test.cli(&["list"]);
+    assert!(
+        list_while_attached.status.success(),
+        "short request failed after peer disconnect: stdout={}, stderr={}",
+        String::from_utf8_lossy(&list_while_attached.stdout),
+        String::from_utf8_lossy(&list_while_attached.stderr)
+    );
+    assert!(String::from_utf8_lossy(&list_while_attached.stdout)
+        .lines()
+        .any(|name| name == "stable"));
+
+    let created_other = test.cli(&["new", "other"]);
+    assert!(
+        created_other.status.success(),
+        "new while attached failed: {}",
+        String::from_utf8_lossy(&created_other.stderr)
+    );
+    let killed_other = test.cli(&["kill", "other"]);
+    assert!(
+        killed_other.status.success(),
+        "kill while attached failed: {}",
+        String::from_utf8_lossy(&killed_other.stderr)
+    );
+
+    write_message(&mut attached, &ClientMessage::Detach).unwrap();
+    wait_for_detached(&mut attached);
+    drop(attached);
+
+    let listed = test.cli(&["list"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .any(|name| name == "stable"));
+}
+
+#[test]
+fn takeover_closes_previous_client_connection() {
+    let test = TestDaemon::start();
+    let created = test.cli(&["new", "work"]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let mut first = test.attach("work");
+    first
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+
+    let mut second = UnixStream::connect(test.socket_path()).unwrap();
+    write_message(
+        &mut second,
+        &ClientMessage::Takeover {
+            name: "work".to_string(),
+            rows: 24,
+            cols: 80,
+            client_token: SECOND_CLIENT_TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        next_server(&mut second),
+        ServerMessage::Attached { .. }
+    ));
+    assert!(matches!(
+        next_server(&mut second),
+        ServerMessage::Snapshot { .. }
+    ));
+
+    let mut closed = [0_u8; 1];
+    loop {
+        match first.read(&mut closed) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                panic!("old client stayed attached")
+            }
+            Err(_) => break,
+        }
+    }
+
+    write_message(&mut second, &ClientMessage::Detach).unwrap();
+    for _ in 0..10 {
+        if matches!(next_server(&mut second), ServerMessage::Detached) {
+            return;
+        }
+    }
+    panic!("takeover client did not receive Detached");
+}
+
+#[test]
+fn same_client_token_reconnects_and_heartbeats() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "work"]).status.success());
+
+    let mut first = test.attach("work");
+    first
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+
+    let (mut resumed, _) = test.attach_with_token("work", FIRST_CLIENT_TOKEN);
+    let mut closed = [0_u8; 1];
+    assert_eq!(first.read(&mut closed).unwrap(), 0);
+
+    write_message(&mut resumed, &ClientMessage::Heartbeat).unwrap();
+    assert!(matches!(
+        next_server(&mut resumed),
+        ServerMessage::HeartbeatAck
+    ));
+
+    let mut competing = UnixStream::connect(test.socket_path()).unwrap();
+    write_message(
+        &mut competing,
+        &ClientMessage::Attach {
+            name: "work".to_string(),
+            rows: 24,
+            cols: 80,
+            client_token: SECOND_CLIENT_TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        next_server(&mut competing),
+        ServerMessage::Error { message } if message.contains("another client is already attached")
+    ));
+
+    write_message(&mut resumed, &ClientMessage::Detach).unwrap();
+    wait_for_detached(&mut resumed);
+}
+
+#[test]
+fn bridge_forwards_protocol_without_extra_output() {
+    let test = TestDaemon::start();
+    let mut bridge = Command::new(env!("CARGO_BIN_EXE_plux"))
+        .arg("__bridge")
+        .env("XDG_RUNTIME_DIR", &test.runtime)
+        .env("XDG_CONFIG_HOME", &test.config)
+        .env("USER", &test.user)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = bridge.stdin.take().unwrap();
+    let mut stdout = bridge.stdout.take().unwrap();
+    write_message(&mut stdin, &ClientMessage::List).unwrap();
+    assert!(matches!(
+        next_server(&mut stdout),
+        ServerMessage::Sessions { names } if names.is_empty()
+    ));
+    drop(stdin);
+    assert!(bridge.wait().unwrap().success());
+}
+
+#[test]
+fn unauthenticated_interactive_client_cannot_hold_attach_slot() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "work"]).status.success());
+
+    let mut invalid = UnixStream::connect(test.socket_path()).unwrap();
+    write_message(&mut invalid, &ClientMessage::Heartbeat).unwrap();
+    assert!(matches!(
+        next_server(&mut invalid),
+        ServerMessage::Error { .. }
+    ));
+    drop(invalid);
+
+    let mut attached = test.attach("work");
+    write_message(&mut attached, &ClientMessage::Detach).unwrap();
+    wait_for_detached(&mut attached);
+}
+
+#[test]
+fn invalid_takeover_keeps_current_client_and_daemon_alive() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "work"]).status.success());
+
+    let mut attached = test.attach("work");
+    let mut invalid = UnixStream::connect(test.socket_path()).unwrap();
+    write_message(
+        &mut invalid,
+        &ClientMessage::Takeover {
+            name: "bad/name".to_string(),
+            rows: 24,
+            cols: 80,
+            client_token: SECOND_CLIENT_TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        next_server(&mut invalid),
+        ServerMessage::Error { .. }
+    ));
+
+    write_message(&mut attached, &ClientMessage::Resize { rows: 24, cols: 80 }).unwrap();
+    assert!(matches!(
+        next_server(&mut attached),
+        ServerMessage::Snapshot { .. }
+    ));
+    assert!(test.cli(&["list"]).status.success());
+
+    write_message(&mut attached, &ClientMessage::Detach).unwrap();
+    wait_for_detached(&mut attached);
+}
+
+#[test]
+fn missing_takeover_keeps_current_client_attached() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "work"]).status.success());
+
+    let mut attached = test.attach("work");
+    let mut takeover = UnixStream::connect(test.socket_path()).unwrap();
+    write_message(
+        &mut takeover,
+        &ClientMessage::Takeover {
+            name: "missing".to_string(),
+            rows: 24,
+            cols: 80,
+            client_token: SECOND_CLIENT_TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        next_server(&mut takeover),
+        ServerMessage::Error { message } if message.contains("session does not exist: missing")
+    ));
+
+    write_message(&mut attached, &ClientMessage::Resize { rows: 24, cols: 80 }).unwrap();
+    assert!(matches!(
+        next_server(&mut attached),
+        ServerMessage::Snapshot { .. }
+    ));
+    write_message(&mut attached, &ClientMessage::Detach).unwrap();
+    wait_for_detached(&mut attached);
+}
+
+#[test]
+fn final_snapshot_arrives_before_process_exit() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "final",
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "read line; printf 'final-marker\\n'".to_string(),
+        ],
+    );
+
+    let mut attached = test.attach("final");
+    write_message(
+        &mut attached,
+        &ClientMessage::Input {
+            bytes: b"run\r".to_vec(),
+        },
+    )
+    .unwrap();
+
+    let mut saw_final_output = false;
+    for _ in 0..10 {
+        match next_server(&mut attached) {
+            ServerMessage::Snapshot { data, .. } => {
+                saw_final_output |= data.contains("final-marker");
+            }
+            ServerMessage::ProcessExited {
+                session_finished, ..
+            } => {
+                assert!(saw_final_output, "process exit arrived before final output");
+                assert!(session_finished);
+                return;
+            }
+            _ => {}
+        }
+    }
+    panic!("process exit was not reported");
+}
+
+#[test]
+fn pane_exit_does_not_finish_a_split_session() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "split"]).status.success());
+
+    let mut attached = test.attach("split");
+    write_message(&mut attached, &ClientMessage::Split { vertical: true }).unwrap();
+    assert!(matches!(
+        next_server(&mut attached),
+        ServerMessage::Snapshot { .. }
+    ));
+    write_message(
+        &mut attached,
+        &ClientMessage::Input {
+            bytes: b"exit\r".to_vec(),
+        },
+    )
+    .unwrap();
+
+    for _ in 0..10 {
+        if let ServerMessage::ProcessExited {
+            session_finished, ..
+        } = next_server(&mut attached)
+        {
+            assert!(!session_finished, "one pane must not end the whole session");
+            write_message(&mut attached, &ClientMessage::Resize { rows: 24, cols: 80 }).unwrap();
+            assert!(matches!(
+                next_server(&mut attached),
+                ServerMessage::Snapshot { .. }
+            ));
+            write_message(&mut attached, &ClientMessage::Detach).unwrap();
+            wait_for_detached(&mut attached);
+            return;
+        }
+    }
+    panic!("pane exit was not reported");
+}
+
+#[test]
+fn concurrent_cold_start_creates_leave_no_daemon_behind() {
+    let mut test = TestDaemon::start();
+    test.daemon.kill().unwrap();
+    test.daemon.wait().unwrap();
+    fs::remove_file(test.socket_path()).unwrap();
+
+    let outputs = thread::scope(|scope| {
+        let test = &test;
+        (0..32)
+            .map(|index| {
+                let name = format!("cold-{index}");
+                scope.spawn(move || test.cli(&["new", &name]))
+            })
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for output in outputs {
+        assert!(
+            output.status.success(),
+            "concurrent cold-start create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let listed = test.cli(&["list"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert!(test.cli(&["stop"]).status.success());
+    for _ in 0..100 {
+        if !test.socket_path().exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("cold-start daemon did not stop");
+}
+
+#[test]
+fn attach_to_missing_session_does_not_create_it() {
+    let test = TestDaemon::start();
+    let mut stream = UnixStream::connect(test.socket_path()).unwrap();
+    write_message(
+        &mut stream,
+        &ClientMessage::Attach {
+            name: "missing".to_string(),
+            rows: 24,
+            cols: 80,
+            client_token: FIRST_CLIENT_TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        next_server(&mut stream),
+        ServerMessage::Error { message } if message.contains("session does not exist: missing")
+    ));
+    write_message(&mut stream, &ClientMessage::Detach).unwrap();
+    wait_for_detached(&mut stream);
+    assert!(!String::from_utf8_lossy(&test.cli(&["list"]).stdout)
+        .lines()
+        .any(|name| name == "missing"));
+}
+
+#[test]
+fn list_without_daemon_does_not_start_one() {
+    let mut test = TestDaemon::start();
+    test.daemon.kill().unwrap();
+    test.daemon.wait().unwrap();
+    fs::remove_file(test.socket_path()).unwrap();
+
+    let listed = test.cli(&["list"]);
+    assert!(!listed.status.success());
+    assert!(!test.socket_path().exists());
+}
+
+#[test]
+fn stop_terminates_the_daemon_and_removes_its_socket() {
+    let mut test = TestDaemon::start();
+    assert!(test.cli(&["new", "work"]).status.success());
+
+    let stopped = test.cli(&["stop"]);
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(test.daemon.wait().unwrap().success());
+    assert!(!test.socket_path().exists());
+}
+
+#[test]
+fn search_completes_without_blocking_the_client_protocol() {
+    let test = TestDaemon::start();
+    let created = test.cli(&["new", "search"]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let mut attached = test.attach("search");
+    write_message(
+        &mut attached,
+        &ClientMessage::Input {
+            bytes: b"printf '\\nsearch-target\\n'\r".to_vec(),
+        },
+    )
+    .unwrap();
+    let mut saw_target = false;
+    for _ in 0..20 {
+        if let ServerMessage::Snapshot { data, .. } = next_server(&mut attached) {
+            if data.contains("search-target") {
+                saw_target = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_target, "shell output did not reach the attached client");
+
+    write_message(
+        &mut attached,
+        &ClientMessage::Search {
+            query: "search-target".to_string(),
+            direction: 1,
+        },
+    )
+    .unwrap();
+    let mut found = false;
+    for _ in 0..10 {
+        if matches!(
+            next_server(&mut attached),
+            ServerMessage::SearchResult { found: true }
+        ) {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "search did not return a positive result");
+
+    write_message(&mut attached, &ClientMessage::Detach).unwrap();
+    wait_for_detached(&mut attached);
+}
+
+#[test]
+fn scroll_snapshot_replays_full_pty_history() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "history",
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "for i in $(seq 0 119); do printf 'history-line-%03d\\n' \"$i\"; done; sleep 1"
+                .to_string(),
+        ],
+    );
+
+    let (mut attached, initial_snapshot) = test.attach_with_snapshot("history");
+    attached
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+
+    let mut saw_last = initial_snapshot.contains("history-line-119");
+    for _ in 0..40 {
+        match read_message(&mut attached) {
+            Ok(Some(ServerMessage::Snapshot { data, .. })) => {
+                if data.contains("history-line-119") {
+                    saw_last = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
+            {
+                break;
+            }
+            Err(error) => panic!("reading history snapshot failed: {error}"),
+        }
+    }
+    assert!(saw_last, "latest PTY output did not reach the client");
+
+    write_message(&mut attached, &ClientMessage::ScrollToTop).unwrap();
+    let mut saw_first = false;
+    for _ in 0..5 {
+        match read_message(&mut attached) {
+            Ok(Some(ServerMessage::Snapshot { data, .. })) => {
+                if data.contains("history-line-000") {
+                    saw_first = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
+            {
+                break;
+            }
+            Err(error) => panic!("reading history snapshot failed: {error}"),
+        }
+    }
+    assert!(
+        saw_first,
+        "scroll-to-top snapshot did not contain old history"
+    );
+
+    write_message(&mut attached, &ClientMessage::ScrollToBottom).unwrap();
+    let mut returned_to_bottom = false;
+    for _ in 0..5 {
+        match read_message(&mut attached) {
+            Ok(Some(ServerMessage::Snapshot { data, .. })) => {
+                if data.contains("history-line-119") {
+                    returned_to_bottom = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
+            {
+                break;
+            }
+            Err(error) => panic!("reading history snapshot failed: {error}"),
+        }
+    }
+    assert!(
+        returned_to_bottom,
+        "scroll-to-bottom snapshot did not restore latest output"
+    );
+}
