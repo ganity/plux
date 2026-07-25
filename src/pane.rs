@@ -362,14 +362,17 @@ mod tests {
         let command = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            r#"stty raw -echo; printf '\033[5n'; response=$(dd bs=4 count=1 2>/dev/null | od -An -t x1); stty sane; case "$response" in *"1b 5b 30 6e"*) printf 'DSR_OK\n';; esac"#.to_string(),
+            r#"stty raw -echo min 1 time 0; printf '\033[5n'; response=$(for i in 1 2 3 4; do dd bs=1 count=1 2>/dev/null; done | od -An -t x1); stty sane; case "$response" in *"1b 5b 30 6e"*) printf 'DSR_OK\n';; esac"#.to_string(),
         ];
         let mut pane =
             Pane::spawn_with_session(3, &Config::default(), 8, 80, "", Some(command), events_tx)
                 .unwrap();
 
         for _ in 0..10 {
-            match events_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            match events_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_else(|error| panic!("PTY event stream closed: {error}"))
+            {
                 PaneEvent::Output { bytes, .. } => {
                     pane.process_output(&bytes);
                     if pane.terminal.contents().contains("DSR_OK") {
@@ -377,7 +380,9 @@ mod tests {
                     }
                 }
                 PaneEvent::ReaderError { error, .. } => panic!("PTY reader failed: {error}"),
-                PaneEvent::Exited { .. } => {}
+                PaneEvent::Exited { status, .. } => {
+                    panic!("child exited before terminal query reply: {status}")
+                }
             }
         }
         panic!("terminal query reply did not reach child");

@@ -1020,7 +1020,7 @@ fn terminal_query_reaches_child_through_daemon() {
         vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            r#"stty raw -echo; printf '\033[5n'; response=$(dd bs=4 count=1 2>/dev/null | od -An -t x1); stty sane; case "$response" in *"1b 5b 30 6e"*) printf 'DSR_DAEMON_OK\n';; esac; sleep 1"#.to_string(),
+            r#"stty raw -echo min 1 time 0; printf '\033[5n'; response=$(for i in 1 2 3 4; do dd bs=1 count=1 2>/dev/null; done | od -An -t x1); stty sane; case "$response" in *"1b 5b 30 6e"*) printf 'DSR_DAEMON_OK\n';; esac; sleep 1"#.to_string(),
         ],
     );
     let (mut attached, initial) = test.attach_with_snapshot("terminal-query");
