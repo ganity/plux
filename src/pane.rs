@@ -362,7 +362,7 @@ mod tests {
         let command = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            r#"stty raw -echo min 1 time 0; printf '\033[5n'; response=$(for i in 1 2 3 4; do dd bs=1 count=1 2>/dev/null; done | od -An -t x1); stty sane; case "$response" in *"1b 5b 30 6e"*) printf 'DSR_OK\n';; esac"#.to_string(),
+            r#"stty raw -echo min 1 time 0; printf '\033[5n'; expected=$(printf '\033[0n'); response=$(for i in 1 2 3 4; do dd bs=1 count=1 2>/dev/null; done); stty sane; if [ "$response" = "$expected" ]; then printf 'DSR_OK\n'; fi"#.to_string(),
         ];
         let mut pane =
             Pane::spawn_with_session(3, &Config::default(), 8, 80, "", Some(command), events_tx)
