@@ -147,7 +147,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
 
     let _guard = TerminalGuard::enter(config.mouse)?;
     spawn_stdin_reader(input_events_tx.clone());
-    spawn_signal_reader(input_events_tx.clone());
+    spawn_signal_reader(input_events_tx.clone())?;
 
     let mut stdout = io::stdout();
     let mut input = InputState::new(rows, cols, prefix_byte);
@@ -821,13 +821,11 @@ fn spawn_stdin_reader(events: mpsc::SyncSender<ClientEvent>) {
         .expect("failed to spawn stdin reader thread");
 }
 
-fn spawn_signal_reader(events: mpsc::SyncSender<ClientEvent>) {
+fn spawn_signal_reader(events: mpsc::SyncSender<ClientEvent>) -> Result<()> {
+    let mut signals = Signals::new([SIGHUP, SIGINT, SIGTERM, SIGWINCH])?;
     thread::Builder::new()
         .name("plux-signal-reader".to_string())
         .spawn(move || {
-            let Ok(mut signals) = Signals::new([SIGHUP, SIGINT, SIGTERM, SIGWINCH]) else {
-                return;
-            };
             for signal in signals.forever() {
                 if signal == SIGWINCH {
                     if events.send(ClientEvent::TerminalResized).is_err() {
@@ -839,7 +837,8 @@ fn spawn_signal_reader(events: mpsc::SyncSender<ClientEvent>) {
                 }
             }
         })
-        .expect("failed to spawn plux signal reader thread");
+        .map_err(|error| format!("failed to spawn plux signal reader thread: {error}"))?;
+    Ok(())
 }
 
 struct InputState {
