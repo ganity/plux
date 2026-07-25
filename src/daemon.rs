@@ -24,7 +24,7 @@ use crate::{
     socket::{remove_socket, set_private_socket, socket_path},
 };
 
-const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 enum Event {

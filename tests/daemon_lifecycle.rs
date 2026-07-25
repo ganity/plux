@@ -198,6 +198,101 @@ fn resize_burst_is_coalesced_without_detaching_client() {
 }
 
 #[test]
+fn large_resize_snapshot_survives_temporary_backpressure() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "large-resize",
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            concat!(
+                "sleep 1; ",
+                "awk 'BEGIN { ",
+                "for (r = 0; r < 620; r++) { ",
+                "for (c = 0; c < 1000; c++) printf \"\\033[3%dmX\", c % 8; ",
+                "printf \"\\033[0m\\n\" } ",
+                "print \"READY\" }'; ",
+                "sleep 30"
+            )
+            .to_string(),
+        ],
+    );
+
+    let mut attached = test.attach("large-resize");
+    attached
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write_message(
+        &mut attached,
+        &ClientMessage::Resize {
+            rows: 620,
+            cols: 1000,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        next_server(&mut attached),
+        ServerMessage::Snapshot {
+            rows: 620,
+            cols: 1000,
+            ..
+        }
+    ));
+
+    let mut saw_ready = false;
+    for _ in 0..100 {
+        if matches!(
+            next_server(&mut attached),
+            ServerMessage::Snapshot { ref data, .. } if data.contains("READY")
+        ) {
+            saw_ready = true;
+            break;
+        }
+    }
+    assert!(saw_ready, "large ANSI fixture did not finish rendering");
+
+    for _ in 0..2 {
+        write_message(&mut attached, &ClientMessage::Heartbeat).unwrap();
+        loop {
+            if matches!(next_server(&mut attached), ServerMessage::HeartbeatAck) {
+                break;
+            }
+        }
+    }
+
+    let mut burst = Vec::new();
+    write_message(
+        &mut burst,
+        &ClientMessage::Resize {
+            rows: 619,
+            cols: 1000,
+        },
+    )
+    .unwrap();
+    write_message(&mut burst, &ClientMessage::Heartbeat).unwrap();
+    attached.write_all(&burst).unwrap();
+    thread::sleep(Duration::from_secs(3));
+
+    let mut saw_snapshot = false;
+    let mut saw_heartbeat = false;
+    while !saw_snapshot || !saw_heartbeat {
+        match next_server(&mut attached) {
+            ServerMessage::Snapshot {
+                rows, cols, data, ..
+            } => {
+                assert!(
+                    data.len() > 3_000_000,
+                    "ANSI fixture snapshot was too small"
+                );
+                saw_snapshot |= (rows, cols) == (619, 1000);
+            }
+            ServerMessage::HeartbeatAck => saw_heartbeat = true,
+            response => panic!("unexpected backpressure response: {response:?}"),
+        }
+    }
+}
+
+#[test]
 fn disconnected_competing_client_does_not_kill_daemon() {
     let test = TestDaemon::start();
     let created = test.cli(&["new", "stable"]);

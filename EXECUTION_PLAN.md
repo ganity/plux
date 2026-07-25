@@ -654,6 +654,7 @@ docs/keybindings.md
 | 2026-07-24 | 回归：粘贴输入分帧 | 相邻原始输入合并为单个协议帧；中文多行 bracketed paste、真实 PTY 粘贴、94 项全量测试验证 | 已完成 |
 | 2026-07-24 | 回归：macOS daemon 生命周期测试 | 测试 socket 使用短 `/tmp` 路径，避免 macOS `sun_path` 超限；长 `TMPDIR` 复现与回归、94 项全量测试、Clippy、格式检查 | 已完成 |
 | 2026-07-24 | 回归：SSH 窗口缩放断连 | daemon 合并 resize burst，只发送最终尺寸快照；256 次连续 resize 回归、95 项全量测试、Clippy、格式检查、release build | 已完成 |
+| 2026-07-24 | 回归：大 ANSI 页面缩放断连 | daemon 写超时由 250ms 调整为 5s；3.7MB Snapshot、3 秒背压回归、96 项全量测试、Clippy、格式检查、release build | 已完成 |
 
 ## 16. 审计发现（2026-07-23）
 
