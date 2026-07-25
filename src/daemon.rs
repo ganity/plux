@@ -442,11 +442,24 @@ impl Daemon {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) => return Err(error.into()),
         };
-        let mut stream = accepted;
         let had_client = self.client.is_some();
-        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let mut stream = accepted;
+        stream.set_nonblocking(false)?;
+        if let Err(error) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
+            if error.kind() == io::ErrorKind::InvalidInput {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
         let message = read_message::<_, ClientMessage>(&mut stream).ok().flatten();
-        stream.set_read_timeout(None)?;
+        if message.is_some() {
+            if let Err(error) = stream.set_read_timeout(None) {
+                if error.kind() == io::ErrorKind::InvalidInput {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+        }
         match message {
             Some(ClientMessage::Attach {
                 name,

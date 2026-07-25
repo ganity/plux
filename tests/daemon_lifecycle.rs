@@ -6,7 +6,7 @@ use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
-    sync::mpsc,
+    sync::{mpsc, Mutex, MutexGuard},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,7 +14,10 @@ use std::{
 use plux::protocol::{read_message, write_message, ClientMessage, ServerMessage};
 use vt100::Parser;
 
+static DAEMON_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 struct TestDaemon {
+    _serial: MutexGuard<'static, ()>,
     root: PathBuf,
     runtime: PathBuf,
     config: PathBuf,
@@ -27,6 +30,9 @@ const SECOND_CLIENT_TOKEN: &str = "fedcba9876543210fedcba9876543210";
 
 impl TestDaemon {
     fn start() -> Self {
+        let serial = DAEMON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -50,6 +56,7 @@ impl TestDaemon {
             .unwrap();
 
         let test = Self {
+            _serial: serial,
             root,
             runtime,
             config,

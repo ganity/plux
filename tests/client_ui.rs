@@ -9,7 +9,7 @@ use std::{
     process::{Command, Output},
     sync::{
         mpsc::{self, Receiver},
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, MutexGuard,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -17,7 +17,10 @@ use std::{
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+static CLIENT_UI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 struct ClientHarness {
+    _serial: MutexGuard<'static, ()>,
     root: PathBuf,
     runtime: PathBuf,
     config: PathBuf,
@@ -31,6 +34,9 @@ struct ClientHarness {
 
 impl ClientHarness {
     fn new(rows: u16, cols: u16) -> Self {
+        let serial = CLIENT_UI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -85,6 +91,7 @@ impl ClientHarness {
         });
 
         Self {
+            _serial: serial,
             root,
             runtime,
             config,
@@ -162,6 +169,26 @@ impl ClientHarness {
 
     fn client_is_running(&mut self) -> bool {
         self.child.try_wait().unwrap().is_none()
+    }
+
+    fn wait_for_pane_count(&self, session: &str, expected: usize, timeout: Duration) {
+        let metadata = self
+            .runtime
+            .join(format!("plux-{}", self.user))
+            .join("sessions")
+            .join(format!("{session}.json"));
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let pane_count = fs::read_to_string(&metadata)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+                .and_then(|metadata| metadata["pane_ids"].as_array().map(Vec::len));
+            if pane_count == Some(expected) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("session {session:?} did not reach {expected} panes");
     }
 
     fn detach(&mut self) {
@@ -321,7 +348,7 @@ fn real_client_split_survives_tiny_resize_and_restores() {
 
     test.writer.write_all(b"\x01v").unwrap();
     test.writer.flush().unwrap();
-    thread::sleep(Duration::from_millis(200));
+    test.wait_for_pane_count("work", 2, Duration::from_secs(5));
     test.writer
         .write_all(b"printf 'PLUX_RIGHT_SPLIT\\n'\r")
         .unwrap();
