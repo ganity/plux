@@ -109,7 +109,7 @@ refresh_rate = 60
 copy_command = "wl-copy"
 ```
 
-The current implementation primarily supports UTF-8 and standard ANSI/VT terminal behavior. It does not automatically detect GBK/Big5, provide Windows support, restore shells after a daemon crash, or support terminal graphics protocols.
+The current implementation primarily supports UTF-8 and standard ANSI/VT terminal behavior. It answers basic status, cursor-position, device-attributes, and character-cell-size queries. It does not automatically detect GBK/Big5, provide Windows support, restore shells after a daemon crash, or support terminal graphics protocols.
 
 `plux run -- ...` executes the command inside a temporary daemon-managed PTY
 session and removes that session after the command exits. Session metadata is
@@ -119,13 +119,15 @@ stored under `$XDG_RUNTIME_DIR/plux-<user>/sessions/` with mode `0600`.
 
 ```bash
 cargo fmt --check
-cargo clippy -- -D warnings
-cargo test
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets
+cargo test --locked --release --all-targets
+cargo check --locked --manifest-path fuzz/Cargo.toml
 ```
 
-The current test suite contains 39 tests plus PTY smoke checks for attach,
-scrollback, search, copy requests, split, zoom, close, detach, `run`, and
-daemon signal cleanup.
+The checks cover daemon protocol and lifecycle, real client PTY attach/input/
+resize, SSH bridge forwarding, ordered snapshots, bounded PTY flow, split
+rendering, scrollback reflow, selection and common terminal query replies.
 
 Set `PLUX_DEBUG=1` when starting a command that auto-starts the daemon to keep
 daemon diagnostics on stderr. Without it, the background daemon is silent.

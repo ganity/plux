@@ -172,34 +172,56 @@ impl LayoutNode {
                 ratio_percent,
                 first,
                 second,
-            } => match direction {
-                SplitDirection::Horizontal => {
-                    let available = rows.saturating_sub(1).max(2);
-                    let first_rows = (available * *ratio_percent / 100).clamp(1, available - 1);
-                    let second_rows = available - first_rows;
-                    first.collect_rects(x, y, first_rows, cols, rects, borders);
-                    borders.push(Border {
-                        x,
-                        y: y + first_rows,
-                        horizontal: true,
-                        length: cols,
-                    });
-                    second.collect_rects(x, y + first_rows + 1, second_rows, cols, rects, borders);
+            } => {
+                if (matches!(direction, SplitDirection::Horizontal) && rows < 3)
+                    || (matches!(direction, SplitDirection::Vertical) && cols < 3)
+                {
+                    first.collect_rects(x, y, rows, cols, rects, borders);
+                    return;
                 }
-                SplitDirection::Vertical => {
-                    let available = cols.saturating_sub(1).max(2);
-                    let first_cols = (available * *ratio_percent / 100).clamp(1, available - 1);
-                    let second_cols = available - first_cols;
-                    first.collect_rects(x, y, rows, first_cols, rects, borders);
-                    borders.push(Border {
-                        x: x + first_cols,
-                        y,
-                        horizontal: false,
-                        length: rows,
-                    });
-                    second.collect_rects(x + first_cols + 1, y, rows, second_cols, rects, borders);
+                match direction {
+                    SplitDirection::Horizontal => {
+                        let available = rows - 1;
+                        let first_rows = (available * *ratio_percent / 100).clamp(1, available - 1);
+                        let second_rows = available - first_rows;
+                        first.collect_rects(x, y, first_rows, cols, rects, borders);
+                        borders.push(Border {
+                            x,
+                            y: y + first_rows,
+                            horizontal: true,
+                            length: cols,
+                        });
+                        second.collect_rects(
+                            x,
+                            y + first_rows + 1,
+                            second_rows,
+                            cols,
+                            rects,
+                            borders,
+                        );
+                    }
+                    SplitDirection::Vertical => {
+                        let available = cols - 1;
+                        let first_cols = (available * *ratio_percent / 100).clamp(1, available - 1);
+                        let second_cols = available - first_cols;
+                        first.collect_rects(x, y, rows, first_cols, rects, borders);
+                        borders.push(Border {
+                            x: x + first_cols,
+                            y,
+                            horizontal: false,
+                            length: rows,
+                        });
+                        second.collect_rects(
+                            x + first_cols + 1,
+                            y,
+                            rows,
+                            second_cols,
+                            rects,
+                            borders,
+                        );
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -265,6 +287,17 @@ mod tests {
             layout.focus_neighbor(1, FocusDirection::Right, 24, 80),
             Some(2)
         );
+    }
+
+    #[test]
+    fn small_terminal_falls_back_to_one_pane() {
+        let mut layout = LayoutNode::leaf(1);
+        layout.split_leaf(1, 2, SplitDirection::Vertical);
+        let mut rects = Vec::new();
+        let mut borders = Vec::new();
+        layout.rects(24, 2, &mut rects, &mut borders);
+        assert_eq!(rects.len(), 1);
+        assert!(borders.is_empty());
     }
 
     trait PaneIds {

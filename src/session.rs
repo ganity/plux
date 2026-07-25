@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::Write,
-    sync::mpsc::Sender,
+    sync::mpsc::SyncSender,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -89,7 +89,7 @@ impl Session {
         rows: u16,
         cols: u16,
         options: SessionOptions,
-        events: Sender<PaneEvent>,
+        events: SyncSender<PaneEvent>,
     ) -> Result<Self> {
         let pane =
             Pane::spawn_with_session(pane_id, config, rows, cols, &name, options.command, events)?;
@@ -214,7 +214,7 @@ impl Session {
         new_pane_id: u64,
         direction: SplitDirection,
         config: &Config,
-        events: Sender<PaneEvent>,
+        events: SyncSender<PaneEvent>,
     ) -> Result<()> {
         let old_focused = self.focused;
         let focused_rect = self
@@ -266,6 +266,7 @@ impl Session {
         if let Some(mut pane) = self.panes.remove(&pane_id) {
             let _ = pane.kill();
         }
+        self.rendered_rows.remove(&pane_id);
         let mut pane_ids = Vec::new();
         self.layout.pane_ids(&mut pane_ids);
         self.focused = pane_ids.first().copied().ok_or("layout has no panes")?;
@@ -297,7 +298,7 @@ impl Session {
     pub fn restart_focused_if_exited(
         &mut self,
         config: &Config,
-        events: Sender<PaneEvent>,
+        events: SyncSender<PaneEvent>,
     ) -> Result<bool> {
         let pane_id = self.focused;
         let Some(old_pane) = self.panes.get(&pane_id) else {
@@ -375,8 +376,10 @@ impl Session {
                     || previous.is_none_or(|previous| previous.get(row) != Some(contents))
                 {
                     write!(output, "\x1b[{};{}H", rect.y + row as u16 + 1, rect.x + 1)?;
-                    output.write_all(contents)?;
-                    output.write_all(b"\x1b[K")?;
+                    output.write_all(b"\x1b[0m")?;
+                    write!(output, "\x1b[{}X", rect.cols.max(1))?;
+                    write_without_global_erase(&mut output, contents);
+                    output.write_all(b"\x1b[0m")?;
                 }
             }
             self.rendered_rows.insert(rect.pane_id, rows);
@@ -446,16 +449,30 @@ impl Session {
     }
 }
 
+fn write_without_global_erase(output: &mut Vec<u8>, contents: &[u8]) {
+    let mut start = 0;
+    while let Some(offset) = contents[start..]
+        .windows(3)
+        .position(|window| window == b"\x1b[K")
+    {
+        let end = start + offset;
+        output.extend_from_slice(&contents[start..end]);
+        start = end + 3;
+    }
+    output.extend_from_slice(&contents[start..]);
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
 
     use super::{Session, SessionOptions};
     use crate::{config::Config, layout::SplitDirection};
+    use vt100::{Color, Parser};
 
     #[test]
     fn session_splits_and_renders_two_panes() {
-        let (events, _) = mpsc::channel();
+        let (events, _) = mpsc::sync_channel(128);
         let session = Session::new_with_command(
             "test".to_string(),
             1,
@@ -470,7 +487,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(session.rectangles().len(), 1);
-        let (events, _) = mpsc::channel();
+        let (events, _) = mpsc::sync_channel(128);
         let mut session = session;
         session
             .split(2, SplitDirection::Vertical, &Config::default(), events)
@@ -479,6 +496,8 @@ mod tests {
         let rendered = session.render().unwrap();
         assert!(rendered.contains('|'));
         assert!(!rendered.contains("\x1b[2J"));
+        assert!(!rendered.contains("\x1b[K"));
+        assert!(rendered.contains("\x1b[40X"));
         assert!(rendered.contains("\x1b[?25h"));
         assert!(rendered.contains("\x1b[?1002h"));
         let unchanged = session.render().unwrap();
@@ -491,11 +510,13 @@ mod tests {
             .process(b"\x1b[?25l");
         assert!(!session.render().unwrap().contains("\x1b[?25h"));
         session.adjust_ratio(5).unwrap();
+        session.close_focused().unwrap();
+        assert!(!session.rendered_rows.contains_key(&2));
     }
 
     #[test]
     fn refuses_horizontal_split_below_minimum_height() {
-        let (events, _) = mpsc::channel();
+        let (events, _) = mpsc::sync_channel(128);
         let mut session = Session::new_with_command(
             "small".to_string(),
             1,
@@ -509,15 +530,61 @@ mod tests {
             events,
         )
         .unwrap();
-        let (events, _) = mpsc::channel();
+        let (events, _) = mpsc::sync_channel(128);
         assert!(session
             .split(2, SplitDirection::Horizontal, &Config::default(), events)
             .is_err());
     }
 
     #[test]
+    fn left_pane_delta_does_not_bleed_into_right_pane() {
+        let (events, _) = mpsc::sync_channel(128);
+        let mut session = Session::new_with_command(
+            "render-bounds".to_string(),
+            1,
+            &Config::default(),
+            24,
+            80,
+            SessionOptions {
+                command: None,
+                temporary: false,
+            },
+            events,
+        )
+        .unwrap();
+        let (events, _) = mpsc::sync_channel(128);
+        session
+            .split(2, SplitDirection::Vertical, &Config::default(), events)
+            .unwrap();
+        session.panes.get_mut(&1).unwrap().terminal.process(b"left");
+        session
+            .panes
+            .get_mut(&2)
+            .unwrap()
+            .terminal
+            .process(b"right");
+
+        let mut outer = Parser::new(24, 80, 0);
+        outer.process(session.render().unwrap().as_bytes());
+        assert_eq!(outer.screen().cell(0, 40).unwrap().contents(), "r");
+
+        session
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .terminal
+            .process(b"\x1b[31mchanged\x1b[0m");
+        outer.process(session.render().unwrap().as_bytes());
+        assert_eq!(outer.screen().cell(0, 40).unwrap().contents(), "r");
+        assert_eq!(
+            outer.screen().cell(0, 40).unwrap().fgcolor(),
+            Color::Default
+        );
+    }
+
+    #[test]
     fn restarts_exited_focused_pane() {
-        let (events, _) = mpsc::channel();
+        let (events, _) = mpsc::sync_channel(128);
         let mut session = Session::new_with_command(
             "restart".to_string(),
             1,

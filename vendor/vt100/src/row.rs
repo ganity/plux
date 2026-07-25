@@ -29,8 +29,16 @@ impl Row {
         self.wrapped = false;
     }
 
-    fn cells(&self) -> impl Iterator<Item = &crate::Cell> {
+    fn iter_cells(&self) -> impl Iterator<Item = &crate::Cell> {
         self.cells.iter()
+    }
+
+    pub(crate) fn cells(&self) -> &[crate::Cell] {
+        &self.cells
+    }
+
+    pub(crate) fn from_cells(cells: Vec<crate::Cell>, wrapped: bool) -> Self {
+        Self { cells, wrapped }
     }
 
     pub fn get(&self, col: u16) -> Option<&crate::Cell> {
@@ -100,7 +108,7 @@ impl Row {
 
         let mut prev_col = start;
         for (col, cell) in self
-            .cells()
+            .iter_cells()
             .enumerate()
             .skip(usize::from(start))
             .take(usize::from(width))
@@ -168,7 +176,7 @@ impl Row {
 
         let mut erase: Option<(u16, &crate::attrs::Attrs)> = None;
         for (col, cell) in self
-            .cells()
+            .iter_cells()
             .enumerate()
             .skip(usize::from(start))
             .take(usize::from(width))
@@ -306,8 +314,8 @@ impl Row {
 
         let mut erase: Option<(u16, &crate::attrs::Attrs)> = None;
         for (col, (cell, prev_cell)) in self
-            .cells()
-            .zip(prev.cells())
+            .iter_cells()
+            .zip(prev.iter_cells())
             .enumerate()
             .skip(usize::from(start))
             .take(usize::from(width))

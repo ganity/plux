@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     env,
     fmt::Write as _,
     fs::File,
@@ -17,7 +16,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use signal_hook::{
-    consts::{SIGHUP, SIGINT, SIGTERM},
+    consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH},
     iterator::Signals,
 };
 
@@ -32,7 +31,9 @@ use crate::{
 const MOUSE_SCROLL_LINES: i32 = 3;
 const MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
-const CLIENT_EVENT_CAPACITY: usize = 128;
+const CLIENT_INPUT_CAPACITY: usize = 256;
+const CLIENT_SERVER_CAPACITY: usize = 8;
+const MAX_CONSECUTIVE_INPUT_EVENTS: usize = 8;
 type ClientWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 pub fn request(config: &Config, message: ClientMessage) -> Result<ServerMessage> {
@@ -117,17 +118,26 @@ fn connection_failure(connection: &mut Connection, message: impl Into<String>) -
 }
 
 pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<()> {
+    let mut session_name = name;
     let prefix_byte = config.prefix_byte()?;
     let (mut cols, mut rows) = terminal_size()?;
     match ssh_target {
-        Some(target) => create_session_if_missing_ssh(target, &name, rows, cols)?,
-        None => create_session_if_missing(config, &name, rows, cols)?,
+        Some(target) => create_session_if_missing_ssh(target, &session_name, rows, cols)?,
+        None => create_session_if_missing(config, &session_name, rows, cols)?,
     }
     let client_token = generate_client_token()?;
-    let mut connection = attach_stream(config, &name, true, rows, cols, &client_token, ssh_target)?;
+    let mut connection = attach_stream(
+        config,
+        &session_name,
+        true,
+        rows,
+        cols,
+        &client_token,
+        ssh_target,
+    )?;
     let mut writer = connection.writer.clone();
-    let (input_events_tx, input_events_rx) = mpsc::sync_channel(CLIENT_EVENT_CAPACITY);
-    let (server_events_tx, server_events_rx) = mpsc::sync_channel(CLIENT_EVENT_CAPACITY);
+    let (input_events_tx, input_events_rx) = mpsc::sync_channel(CLIENT_INPUT_CAPACITY);
+    let (server_events_tx, server_events_rx) = mpsc::sync_channel(CLIENT_SERVER_CAPACITY);
     let mut connection_generation = 1;
     spawn_server_reader(
         connection.take_reader(),
@@ -148,32 +158,8 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
     let mut reconnect_backoff = Duration::from_millis(500);
     let mut last_heartbeat_sent = Instant::now();
     let mut last_heartbeat_ack = Instant::now();
-    let mut pending_server_events = VecDeque::new();
+    let mut consecutive_input_events = 0;
     loop {
-        let (next_cols, next_rows) = terminal_size()?;
-        if (next_rows, next_cols) != (rows, cols) {
-            rows = next_rows;
-            cols = next_cols;
-            input.set_size(rows, cols);
-            view.set_size(rows, cols);
-            if connected {
-                if let Err(error) = send(&writer, &ClientMessage::Resize { rows, cols }) {
-                    mark_reconnecting(
-                        &mut connection,
-                        &mut connected,
-                        &mut waiting_snapshot,
-                        &mut next_reconnect,
-                        Instant::now(),
-                    );
-                    draw_connection_status(
-                        &mut stdout,
-                        rows,
-                        &format!("connection lost: {error}; reconnecting"),
-                    )?;
-                }
-            }
-        }
-
         let now = Instant::now();
         if connected {
             if connection.try_wait()?.is_some() {
@@ -184,7 +170,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                     &mut next_reconnect,
                     now,
                 );
-                draw_connection_status(&mut stdout, rows, "connection exited; reconnecting")?;
+                draw_connection_status(&mut stdout, rows, cols, "connection exited; reconnecting")?;
             } else if last_heartbeat_ack.elapsed() >= Duration::from_secs(30) {
                 mark_reconnecting(
                     &mut connection,
@@ -193,7 +179,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                     &mut next_reconnect,
                     now,
                 );
-                draw_connection_status(&mut stdout, rows, "heartbeat timeout; reconnecting")?;
+                draw_connection_status(&mut stdout, rows, cols, "heartbeat timeout; reconnecting")?;
             } else if last_heartbeat_sent.elapsed() >= Duration::from_secs(5) {
                 if let Err(error) = send(&writer, &ClientMessage::Heartbeat) {
                     mark_reconnecting(
@@ -206,6 +192,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                     draw_connection_status(
                         &mut stdout,
                         rows,
+                        cols,
                         &format!("heartbeat failed: {error}; reconnecting"),
                     )?;
                 } else {
@@ -214,8 +201,16 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
             }
         } else if !waiting_snapshot && now >= next_reconnect {
             connection.close();
-            draw_connection_status(&mut stdout, rows, "reconnecting...")?;
-            match attach_stream(config, &name, false, rows, cols, &client_token, ssh_target) {
+            draw_connection_status(&mut stdout, rows, cols, "reconnecting...")?;
+            match attach_stream(
+                config,
+                &session_name,
+                false,
+                rows,
+                cols,
+                &client_token,
+                ssh_target,
+            ) {
                 Ok(mut new_connection) => {
                     connection_generation += 1;
                     writer = new_connection.writer.clone();
@@ -231,6 +226,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                     draw_connection_status(
                         &mut stdout,
                         rows,
+                        cols,
                         "reconnecting; waiting for terminal snapshot",
                     )?;
                 }
@@ -245,6 +241,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                     draw_connection_status(
                         &mut stdout,
                         rows,
+                        cols,
                         &format!("reconnect failed: {message}"),
                     )?;
                     next_reconnect = now + reconnect_backoff;
@@ -259,13 +256,13 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                 &mut next_reconnect,
                 now,
             );
-            draw_connection_status(&mut stdout, rows, "snapshot timeout; reconnecting")?;
+            draw_connection_status(&mut stdout, rows, cols, "snapshot timeout; reconnecting")?;
         }
 
         match receive_client_event(
             &input_events_rx,
             &server_events_rx,
-            &mut pending_server_events,
+            &mut consecutive_input_events,
         ) {
             Ok(ClientEvent::Input(bytes)) => {
                 if !connected {
@@ -277,12 +274,20 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                 let previous_selection = input.selection_coordinates_if_active();
                 let mut reconnect_error = None;
                 for action in input.feed(&bytes) {
+                    let renamed_session = match &action {
+                        InputAction::Message(ClientMessage::Rename { name }) => Some(name.clone()),
+                        _ => None,
+                    };
                     match handle_action(&writer, action) {
                         Ok(true) => {
                             let _ = send(&writer, &ClientMessage::Detach);
                             return Ok(());
                         }
-                        Ok(false) => {}
+                        Ok(false) => {
+                            if let Some(name) = renamed_session {
+                                session_name = name;
+                            }
+                        }
                         Err(error) => {
                             reconnect_error = Some(error.to_string());
                             break;
@@ -300,6 +305,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                     draw_connection_status(
                         &mut stdout,
                         rows,
+                        cols,
                         &format!("input failed: {error}; reconnecting"),
                     )?;
                     continue;
@@ -308,13 +314,40 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                 if previous_selection != current_selection {
                     view.redraw_selection(&mut stdout, previous_selection, current_selection)?;
                 }
-                draw_input_status(&mut stdout, &mut input, &view)?;
+                draw_input_status(&mut stdout, &mut input, &view, &session_name)?;
+            }
+            Ok(ClientEvent::TerminalResized) => {
+                if refresh_terminal_size(&mut input, &mut view, &mut rows, &mut cols)? && connected
+                {
+                    if let Err(error) = send(&writer, &ClientMessage::Resize { rows, cols }) {
+                        mark_reconnecting(
+                            &mut connection,
+                            &mut connected,
+                            &mut waiting_snapshot,
+                            &mut next_reconnect,
+                            Instant::now(),
+                        );
+                        draw_connection_status(
+                            &mut stdout,
+                            rows,
+                            cols,
+                            &format!("connection lost: {error}; reconnecting"),
+                        )?;
+                    }
+                }
             }
             Ok(ClientEvent::Server {
                 generation,
                 message,
             }) if generation == connection_generation => {
-                match handle_server_message(config, &mut input, &mut view, &mut stdout, message)? {
+                match handle_server_message(
+                    config,
+                    &mut input,
+                    &mut view,
+                    &mut stdout,
+                    &session_name,
+                    message,
+                )? {
                     ServerAction::Detached | ServerAction::SessionFinished => break,
                     ServerAction::HeartbeatAck => last_heartbeat_ack = Instant::now(),
                     ServerAction::Snapshot if waiting_snapshot => {
@@ -344,18 +377,33 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                     &mut next_reconnect,
                     Instant::now(),
                 );
-                draw_connection_status(&mut stdout, rows, &format!("{message}; reconnecting"))?;
+                draw_connection_status(
+                    &mut stdout,
+                    rows,
+                    cols,
+                    &format!("{message}; reconnecting"),
+                )?;
             }
             Ok(ClientEvent::ServerClosed { .. }) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if connected {
                     if let Some(action) = input.tick() {
+                        let renamed_session = match &action {
+                            InputAction::Message(ClientMessage::Rename { name }) => {
+                                Some(name.clone())
+                            }
+                            _ => None,
+                        };
                         match handle_action(&writer, action) {
                             Ok(true) => {
                                 let _ = send(&writer, &ClientMessage::Detach);
                                 return Ok(());
                             }
-                            Ok(false) => {}
+                            Ok(false) => {
+                                if let Some(name) = renamed_session {
+                                    session_name = name;
+                                }
+                            }
                             Err(error) => {
                                 mark_reconnecting(
                                     &mut connection,
@@ -367,6 +415,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                                 draw_connection_status(
                                     &mut stdout,
                                     rows,
+                                    cols,
                                     &format!("input failed: {error}; reconnecting"),
                                 )?;
                             }
@@ -395,6 +444,7 @@ fn handle_server_message(
     input: &mut InputState,
     view: &mut TerminalView,
     stdout: &mut impl Write,
+    session_name: &str,
     message: ServerMessage,
 ) -> Result<ServerAction> {
     match message {
@@ -412,10 +462,10 @@ fn handle_server_message(
             input.set_scrollback_available(scrollback_available);
             view.set_size(rows, cols);
             view.process(&data);
-            stdout.write_all(data.replace("\x1b[2J", "").as_bytes())?;
+            stdout.write_all(data.as_bytes())?;
             view.redraw_selection(stdout, None, input.selection_coordinates_if_active())?;
             stdout.flush()?;
-            draw_input_status(stdout, input, view)?;
+            draw_input_status(stdout, input, view, session_name)?;
             Ok(ServerAction::Snapshot)
         }
         ServerMessage::Detached => Ok(ServerAction::Detached),
@@ -469,12 +519,19 @@ fn is_retryable_reconnect_error(message: &str) -> bool {
         && !message.contains("invalid client token")
 }
 
-fn draw_connection_status(stdout: &mut impl Write, rows: u16, message: &str) -> Result<()> {
+fn draw_connection_status(
+    stdout: &mut impl Write,
+    rows: u16,
+    cols: u16,
+    message: &str,
+) -> Result<()> {
     execute!(
         stdout,
         MoveTo(0, rows.saturating_sub(1)),
         Clear(ClearType::CurrentLine)
     )?;
+    let available = usize::from(cols.saturating_sub(2));
+    let message = message.chars().take(available).collect::<String>();
     write!(stdout, "\x1b[7m {message} \x1b[0m")?;
     stdout.flush()?;
     Ok(())
@@ -484,8 +541,11 @@ fn draw_input_status(
     stdout: &mut impl Write,
     input: &mut InputState,
     view: &TerminalView,
+    session_name: &str,
 ) -> Result<()> {
-    let status = input.status_text();
+    let status = input
+        .status_text()
+        .map(|status| format!("{session_name} | {status}"));
     if status.is_none() && !input.status_drawn {
         return Ok(());
     }
@@ -501,6 +561,8 @@ fn draw_input_status(
         Clear(ClearType::CurrentLine)
     )?;
     if let Some(status) = status {
+        let available = usize::from(input.cols.saturating_sub(2));
+        let status = status.chars().take(available).collect::<String>();
         stdout.write_all(b"\x1b[?25h")?;
         write!(stdout, "\x1b[7m {status} \x1b[0m")?;
         input.status_drawn = true;
@@ -554,6 +616,7 @@ fn create_session_if_missing(config: &Config, name: &str, rows: u16, cols: u16) 
         },
     )? {
         ServerMessage::Created { .. } => Ok(()),
+        ServerMessage::Error { message } if message.contains("session already exists") => Ok(()),
         ServerMessage::Error { message } => Err(message.into()),
         response => Err(format!("unexpected create response: {response:?}").into()),
     }
@@ -580,6 +643,7 @@ fn create_session_if_missing_ssh(target: &str, name: &str, rows: u16, cols: u16)
         },
     )? {
         ServerMessage::Created { .. } => Ok(()),
+        ServerMessage::Error { message } if message.contains("session already exists") => Ok(()),
         ServerMessage::Error { message } => Err(message.into()),
         response => Err(format!("unexpected create response: {response:?}").into()),
     }
@@ -608,6 +672,23 @@ fn terminal_size() -> Result<(u16, u16)> {
     Ok((cols.max(1), rows.max(2)))
 }
 
+fn refresh_terminal_size(
+    input: &mut InputState,
+    view: &mut TerminalView,
+    rows: &mut u16,
+    cols: &mut u16,
+) -> Result<bool> {
+    let (next_cols, next_rows) = terminal_size()?;
+    if (next_rows, next_cols) == (*rows, *cols) {
+        return Ok(false);
+    }
+    *rows = next_rows;
+    *cols = next_cols;
+    input.set_size(*rows, *cols);
+    view.set_size(*rows, *cols);
+    Ok(true)
+}
+
 fn generate_client_token() -> Result<String> {
     let mut bytes = [0_u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
@@ -620,6 +701,7 @@ fn generate_client_token() -> Result<String> {
 
 enum ClientEvent {
     Input(Vec<u8>),
+    TerminalResized,
     Server {
         generation: u64,
         message: ServerMessage,
@@ -639,44 +721,35 @@ fn send(writer: &ClientWriter, message: &ClientMessage) -> Result<()> {
 fn receive_client_event(
     input_events: &mpsc::Receiver<ClientEvent>,
     server_events: &mpsc::Receiver<ClientEvent>,
-    pending_server_events: &mut VecDeque<ClientEvent>,
+    consecutive_input_events: &mut usize,
 ) -> std::result::Result<ClientEvent, mpsc::RecvTimeoutError> {
+    if *consecutive_input_events >= MAX_CONSECUTIVE_INPUT_EVENTS {
+        match server_events.try_recv() {
+            Ok(event) => {
+                *consecutive_input_events = 0;
+                return Ok(event);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(mpsc::RecvTimeoutError::Disconnected)
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
     match input_events.try_recv() {
-        Ok(event) => return Ok(event),
+        Ok(event) => {
+            if matches!(event, ClientEvent::Input(_)) {
+                *consecutive_input_events += 1;
+            } else {
+                *consecutive_input_events = 0;
+            }
+            return Ok(event);
+        }
         Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvTimeoutError::Disconnected),
         Err(mpsc::TryRecvError::Empty) => {}
     }
-    if let Some(event) = pending_server_events.pop_front() {
-        return Ok(event);
-    }
-
     let event = server_events.recv_timeout(Duration::from_millis(10))?;
-    let Some(generation) = snapshot_generation(&event) else {
-        return Ok(event);
-    };
-
-    let mut latest = event;
-    loop {
-        match server_events.try_recv() {
-            Ok(next) if snapshot_generation(&next) == Some(generation) => latest = next,
-            Ok(next) => {
-                pending_server_events.push_back(next);
-                break;
-            }
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
-        }
-    }
-    Ok(latest)
-}
-
-fn snapshot_generation(event: &ClientEvent) -> Option<u64> {
-    match event {
-        ClientEvent::Server {
-            generation,
-            message: ServerMessage::Snapshot { .. },
-        } => Some(*generation),
-        _ => None,
-    }
+    *consecutive_input_events = 0;
+    Ok(event)
 }
 
 fn spawn_server_reader<R: Read + Send + 'static>(
@@ -752,11 +825,18 @@ fn spawn_signal_reader(events: mpsc::SyncSender<ClientEvent>) {
     thread::Builder::new()
         .name("plux-signal-reader".to_string())
         .spawn(move || {
-            let Ok(mut signals) = Signals::new([SIGHUP, SIGINT, SIGTERM]) else {
+            let Ok(mut signals) = Signals::new([SIGHUP, SIGINT, SIGTERM, SIGWINCH]) else {
                 return;
             };
-            if signals.forever().next().is_some() {
-                let _ = events.send(ClientEvent::InputClosed);
+            for signal in signals.forever() {
+                if signal == SIGWINCH {
+                    if events.send(ClientEvent::TerminalResized).is_err() {
+                        return;
+                    }
+                } else {
+                    let _ = events.send(ClientEvent::InputClosed);
+                    return;
+                }
             }
         })
         .expect("failed to spawn plux signal reader thread");
@@ -945,6 +1025,13 @@ impl InputState {
         self.cols = cols;
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        if self
+            .selection_anchor
+            .is_some_and(|(row, col)| row >= rows || col >= cols)
+        {
+            self.selection_anchor = None;
+            self.mouse_selecting = false;
+        }
     }
 
     fn set_mouse_enabled(&mut self, enabled: bool) {
@@ -1563,7 +1650,7 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, os::unix::net::UnixStream, sync::mpsc, time::Duration};
+    use std::{os::unix::net::UnixStream, sync::mpsc, time::Duration};
 
     use super::{
         draw_input_status, spawn_server_reader, ClientEvent, InputAction, InputState, TerminalView,
@@ -1639,9 +1726,23 @@ mod tests {
         input.status_drawn = true;
         let mut rendered = Vec::new();
 
-        draw_input_status(&mut rendered, &mut input, &view).unwrap();
+        draw_input_status(&mut rendered, &mut input, &view, "work").unwrap();
 
         assert!(String::from_utf8_lossy(&rendered).contains("bottom"));
+    }
+
+    #[test]
+    fn status_bar_includes_session_name_in_scroll_mode() {
+        let mut view = TerminalView::new(2, 30);
+        view.process("top\r\nbottom");
+        let mut input = InputState::new(2, 30, 0);
+        input.enter_scroll_mode();
+        let mut rendered = Vec::new();
+
+        draw_input_status(&mut rendered, &mut input, &view, "work").unwrap();
+
+        let rendered = String::from_utf8_lossy(&rendered);
+        assert!(rendered.contains("work | scroll:"));
     }
 
     #[test]
@@ -1677,15 +1778,16 @@ mod tests {
         input_tx
             .send(ClientEvent::Input(b"mouse-motion".to_vec()))
             .unwrap();
+        let mut consecutive_input_events = 0;
 
         assert!(matches!(
-            super::receive_client_event(&input_rx, &server_rx, &mut VecDeque::new()),
+            super::receive_client_event(&input_rx, &server_rx, &mut consecutive_input_events),
             Ok(ClientEvent::Input(bytes)) if bytes == b"mouse-motion"
         ));
     }
 
     #[test]
-    fn latest_server_snapshot_replaces_stale_snapshots() {
+    fn server_snapshots_are_delivered_in_order() {
         let (_input_tx, input_rx) = mpsc::sync_channel(4);
         let (server_tx, server_rx) = mpsc::sync_channel(4);
         for data in ["old", "new"] {
@@ -1703,12 +1805,43 @@ mod tests {
                 })
                 .unwrap();
         }
+        let mut consecutive_input_events = 0;
         assert!(matches!(
-            super::receive_client_event(&input_rx, &server_rx, &mut VecDeque::new()),
+            super::receive_client_event(&input_rx, &server_rx, &mut consecutive_input_events),
+            Ok(ClientEvent::Server {
+                message: ServerMessage::Snapshot { data, .. },
+                ..
+            }) if data == "old"
+        ));
+        assert!(matches!(
+            super::receive_client_event(&input_rx, &server_rx, &mut consecutive_input_events),
             Ok(ClientEvent::Server {
                 message: ServerMessage::Snapshot { data, .. },
                 ..
             }) if data == "new"
+        ));
+    }
+
+    #[test]
+    fn input_burst_yields_to_a_pending_server_event() {
+        let (input_tx, input_rx) = mpsc::sync_channel(16);
+        let (server_tx, server_rx) = mpsc::sync_channel(4);
+        for _ in 0..9 {
+            input_tx.send(ClientEvent::Input(vec![b'x'])).unwrap();
+        }
+        server_tx
+            .send(ClientEvent::Server {
+                generation: 1,
+                message: ServerMessage::HeartbeatAck,
+            })
+            .unwrap();
+        let mut consecutive_input_events = 8;
+        assert!(matches!(
+            super::receive_client_event(&input_rx, &server_rx, &mut consecutive_input_events),
+            Ok(ClientEvent::Server {
+                message: ServerMessage::HeartbeatAck,
+                ..
+            })
         ));
     }
 

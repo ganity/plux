@@ -1,5 +1,6 @@
 use std::{
     io::{self, Read, Write},
+    net::Shutdown,
     os::unix::net::UnixStream,
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
@@ -141,11 +142,13 @@ pub fn bridge(config: &Config, start: bool) -> Result<()> {
     };
     let mut socket_writer = stream.try_clone()?;
     let mut socket_reader = stream;
+    let socket_shutdown = socket_reader.try_clone()?;
     let stdin_thread = std::thread::Builder::new()
         .name("plux-bridge-stdin".to_string())
         .spawn(move || {
             let mut stdin = io::stdin().lock();
             let _ = io::copy(&mut stdin, &mut socket_writer);
+            let _ = socket_writer.shutdown(Shutdown::Write);
         })?;
     let mut stdout = io::stdout().lock();
     let mut buffer = [0_u8; 8 * 1024];
@@ -159,9 +162,15 @@ pub fn bridge(config: &Config, start: bool) -> Result<()> {
             Err(error) => break Err(error),
         }
     };
-    drop(stdin_thread);
-    result?;
-    Ok(())
+    if result.is_err() {
+        let _ = socket_shutdown.shutdown(Shutdown::Both);
+    } else {
+        let _ = socket_shutdown.shutdown(Shutdown::Write);
+    }
+    stdin_thread
+        .join()
+        .map_err(|_| "bridge stdin thread panicked")?;
+    result.map_err(Into::into)
 }
 
 impl Drop for Connection {

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preserved ordered snapshots and final PTY output under slow-client backpressure.
+- Coalesced terminal resize bursts, bounded PTY input/output queues, and hardened
+  reconnect and bridge lifecycle handling.
+- Preserved scrollback and wide characters across terminal resize, kept split
+  rendering inside pane bounds, and added common terminal query replies.
 - Changed the default prefix from `Ctrl-Space` to `Ctrl-A` to avoid common IME
   shortcut conflicts; `Ctrl-]` and explicit `prefix = "Ctrl-Space"` remain
   supported.

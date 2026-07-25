@@ -1,9 +1,13 @@
-use vt100::{Parser, Screen};
+use std::collections::VecDeque;
+
+use vt100::{Callbacks, Parser, Screen};
 
 use crate::protocol::CopyMode;
 
 pub struct TerminalState {
-    parser: Parser,
+    parser: Parser<TerminalCallbacks>,
+    scrollback_lines: usize,
+    scrollback_bytes: usize,
 }
 
 impl TerminalState {
@@ -13,14 +17,16 @@ impl TerminalState {
         scrollback_lines: usize,
         scrollback_bytes: usize,
     ) -> Self {
-        // Keep the parser's cell history under the configured byte budget by
-        // reserving a conservative amount per column. The limit is conservative
-        // because terminal attributes and wide graphemes cost more than text.
-        let estimated_bytes_per_line = usize::from(cols).max(1).saturating_mul(8);
-        let byte_limited_lines = (scrollback_bytes / estimated_bytes_per_line).max(1);
-        let history_lines = scrollback_lines.min(byte_limited_lines);
+        let history_lines = history_capacity(cols, scrollback_lines, scrollback_bytes);
         Self {
-            parser: Parser::new(rows, cols, history_lines),
+            parser: Parser::new_with_callbacks(
+                rows.max(1),
+                cols.max(1),
+                history_lines,
+                TerminalCallbacks::default(),
+            ),
+            scrollback_lines,
+            scrollback_bytes,
         }
     }
 
@@ -28,8 +34,17 @@ impl TerminalState {
         self.parser.process(bytes);
     }
 
+    pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
+        self.parser.callbacks_mut().take_replies()
+    }
+
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser.screen_mut().set_size(rows, cols);
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        let history_lines = history_capacity(cols, self.scrollback_lines, self.scrollback_bytes);
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback_len(history_lines);
+        screen.set_size(rows, cols);
     }
 
     pub fn set_scrollback(&mut self, rows: usize) {
@@ -145,9 +160,80 @@ impl TerminalState {
     }
 
     #[cfg(test)]
+    fn history_capacity(&self) -> usize {
+        self.parser.screen().scrollback_len()
+    }
+
+    #[cfg(test)]
     pub fn contents(&self) -> String {
         self.parser.screen().contents()
     }
+}
+
+const MAX_REPLY_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct TerminalCallbacks {
+    replies: VecDeque<Vec<u8>>,
+    reply_bytes: usize,
+    overflowed: bool,
+}
+
+impl TerminalCallbacks {
+    fn take_replies(&mut self) -> Vec<Vec<u8>> {
+        self.reply_bytes = 0;
+        self.replies.drain(..).collect()
+    }
+
+    fn push_reply(&mut self, reply: Vec<u8>) {
+        if self.reply_bytes.saturating_add(reply.len()) > MAX_REPLY_BYTES {
+            self.overflowed = true;
+            return;
+        }
+        self.reply_bytes += reply.len();
+        self.replies.push_back(reply);
+    }
+}
+
+impl Callbacks for TerminalCallbacks {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut Screen,
+        i1: Option<u8>,
+        _i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        let first = params
+            .first()
+            .and_then(|param| param.first())
+            .copied()
+            .unwrap_or(0);
+        match (i1, c, first) {
+            (None, 'n', 5) => self.push_reply(b"\x1b[0n".to_vec()),
+            (None, 'n', 6) => {
+                let (row, col) = screen.cursor_position();
+                self.push_reply(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+            }
+            (None, 'c', 0) => self.push_reply(b"\x1b[?1;2c".to_vec()),
+            (Some(b'>'), 'c', 0) => self.push_reply(b"\x1b[>0;95;0c".to_vec()),
+            (None, 't', 18) => {
+                let (rows, cols) = screen.size();
+                self.push_reply(format!("\x1b[8;{};{}t", rows, cols).into_bytes());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn history_capacity(cols: u16, scrollback_lines: usize, scrollback_bytes: usize) -> usize {
+    let cell_bytes = std::mem::size_of::<vt100::Cell>();
+    let row_overhead = std::mem::size_of::<Vec<vt100::Cell>>() + std::mem::size_of::<bool>();
+    let bytes_per_line = usize::from(cols)
+        .max(1)
+        .saturating_mul(cell_bytes)
+        .saturating_add(row_overhead);
+    scrollback_lines.min(scrollback_bytes / bytes_per_line)
 }
 
 #[cfg(test)]
@@ -175,6 +261,64 @@ mod tests {
         let mut terminal = TerminalState::with_limits(4, 20, 10, usize::MAX);
         terminal.resize(8, 40);
         assert_eq!(terminal.screen().size(), (8, 40));
+    }
+
+    #[test]
+    fn resize_preserves_wrapped_logical_lines() {
+        let mut terminal = TerminalState::with_limits(3, 20, 20, usize::MAX);
+        terminal.process(b"abcdefghijklmnopqrstuv\r\nnext");
+
+        terminal.resize(3, 8);
+        terminal.scroll_to_top();
+        assert!(terminal.contents().contains("abcdefghijklmnopqrstuv"));
+
+        terminal.resize(3, 20);
+        terminal.scroll_to_top();
+        assert!(terminal.contents().contains("abcdefghijklmnopqrstuv"));
+    }
+
+    #[test]
+    fn history_capacity_uses_actual_cell_cost() {
+        let terminal = TerminalState::with_limits(24, 120, usize::MAX, 32 * 1024);
+        assert!(terminal.history_capacity() <= 32 * 1024 / std::mem::size_of::<vt100::Cell>());
+    }
+
+    #[test]
+    fn resize_keeps_wide_characters_intact() {
+        let mut terminal = TerminalState::with_limits(3, 6, 20, usize::MAX);
+        terminal.process("ab中cd日本語".as_bytes());
+
+        terminal.resize(3, 4);
+        terminal.scroll_to_top();
+        let contents = terminal.contents();
+        assert!(contents.contains('中'));
+        assert!(contents.contains('日'));
+        assert!(contents.contains('本'));
+        assert!(contents.contains('語'));
+    }
+
+    #[test]
+    fn shrinking_rows_moves_old_visible_content_into_history() {
+        let mut terminal = TerminalState::with_limits(4, 20, 20, usize::MAX);
+        terminal.process(b"line-1\r\nline-2\r\nline-3\r\nline-4");
+
+        terminal.resize(2, 20);
+        terminal.scroll_to_top();
+        assert!(terminal.contents().contains("line-1"));
+        assert!(terminal.contents().contains("line-2"));
+    }
+
+    #[test]
+    fn resize_keeps_a_scrolled_history_marker_near_the_viewport() {
+        let mut terminal = TerminalState::with_limits(4, 20, 20, usize::MAX);
+        for index in 0..12 {
+            terminal.process(format!("marker-{index}\r\n").as_bytes());
+        }
+        terminal.scroll(4);
+        assert!(terminal.contents().contains("marker-7"));
+
+        terminal.resize(4, 8);
+        assert!(terminal.contents().contains("marker-7"));
     }
 
     #[test]
@@ -277,5 +421,30 @@ mod tests {
         terminal.process(b"primary\x1b[?1049halt\x1b[2J\x1b[?1049l");
         assert!(terminal.contents().contains("primary"));
         assert!(!terminal.contents().contains("alt"));
+    }
+
+    #[test]
+    fn answers_common_terminal_queries() {
+        let mut terminal = TerminalState::with_limits(4, 20, 10, usize::MAX);
+        terminal.process(b"\x1b[2;3H\x1b[5n\x1b[6n\x1b[c\x1b[>c\x1b[18t");
+
+        assert_eq!(
+            terminal.take_replies(),
+            vec![
+                b"\x1b[0n".to_vec(),
+                b"\x1b[2;3R".to_vec(),
+                b"\x1b[?1;2c".to_vec(),
+                b"\x1b[>0;95;0c".to_vec(),
+                b"\x1b[8;4;20t".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_queries_survive_parser_chunk_boundaries() {
+        let mut terminal = TerminalState::with_limits(2, 10, 10, usize::MAX);
+        terminal.process(b"\x1b[");
+        terminal.process(b"5n");
+        assert_eq!(terminal.take_replies(), vec![b"\x1b[0n".to_vec()]);
     }
 }

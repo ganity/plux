@@ -62,39 +62,91 @@ impl Grid {
     }
 
     pub fn set_size(&mut self, size: Size) {
-        if size.cols != self.size.cols {
-            for row in &mut self.rows {
-                row.wrap(false);
-            }
-        }
-
-        if self.scroll_bottom == self.size.rows - 1 {
-            self.scroll_bottom = size.rows - 1;
-        }
+        let size = Size {
+            rows: size.rows.max(1),
+            cols: size.cols.max(1),
+        };
+        let old_size = self.size;
+        let old_history_len = self.scrollback.len();
+        let old_scrollback = self.scrollback_offset;
+        let old_pos = self.pos;
+        let old_saved_pos = self.saved_pos;
+        let old_scroll_top = self.scroll_top;
+        let old_scroll_bottom = self.scroll_bottom;
+        let mut all_rows = self.scrollback.drain(..).collect::<Vec<_>>();
+        all_rows.append(&mut self.rows);
+        let (lines, locations) = logical_lines(all_rows);
+        let (reflowed, line_starts) = reflow_lines(&lines, size.cols);
+        let visible_start = reflowed.len().saturating_sub(usize::from(size.rows));
+        let history_start = visible_start.saturating_sub(self.scrollback_len);
+        let history_len = visible_start - history_start;
 
         self.size = size;
-        for row in &mut self.rows {
-            row.resize(size.cols, crate::Cell::new());
-        }
+        self.scrollback = reflowed[history_start..visible_start]
+            .iter()
+            .cloned()
+            .collect();
+        self.rows = reflowed[visible_start..].to_vec();
         self.rows.resize(usize::from(size.rows), self.new_row());
+        self.scrollback_offset = if old_scrollback == 0 {
+            0
+        } else {
+            let old_anchor = old_history_len
+                .saturating_sub(old_scrollback)
+                .min(locations.len().saturating_sub(1));
+            let (line, offset) = locations
+                .get(old_anchor)
+                .copied()
+                .unwrap_or_default();
+            let mapped = line_starts
+                .get(line)
+                .copied()
+                .unwrap_or(visible_start)
+                .saturating_add(offset / usize::from(size.cols));
+            if mapped < history_start {
+                history_len
+            } else if mapped < visible_start {
+                history_len - (mapped - history_start)
+            } else {
+                0
+            }
+        };
 
-        if self.scroll_bottom >= size.rows {
+        self.pos = map_position(
+            old_history_len,
+            old_pos,
+            &locations,
+            &line_starts,
+            visible_start,
+            size,
+        );
+        self.saved_pos = map_position(
+            old_history_len,
+            old_saved_pos,
+            &locations,
+            &line_starts,
+            visible_start,
+            size,
+        );
+
+        self.scroll_top = old_scroll_top.min(size.rows - 1);
+        self.scroll_bottom = if old_scroll_bottom == old_size.rows - 1 {
+            size.rows - 1
+        } else {
+            old_scroll_bottom.min(size.rows - 1)
+        };
+        if self.scroll_top >= self.scroll_bottom {
+            self.scroll_top = 0;
             self.scroll_bottom = size.rows - 1;
         }
-        if self.scroll_bottom < self.scroll_top {
-            self.scroll_top = 0;
-        }
+    }
 
-        self.row_clamp_top(false);
-        self.row_clamp_bottom(false);
-        self.col_clamp();
-
-        if self.saved_pos.row > self.size.rows - 1 {
-            self.saved_pos.row = self.size.rows - 1;
+    pub fn set_scrollback_len(&mut self, len: usize) {
+        self.scrollback_len = len;
+        while self.scrollback.len() > len {
+            self.scrollback.pop_front();
         }
-        if self.saved_pos.col > self.size.cols - 1 {
-            self.saved_pos.col = self.size.cols - 1;
-        }
+        self.scrollback_offset = self.scrollback_offset.min(self.scrollback.len());
     }
 
     pub fn pos(&self) -> Pos {
@@ -690,6 +742,120 @@ impl Grid {
             self.pos.col = self.size.cols - 1;
         }
     }
+}
+
+fn logical_lines(rows: Vec<crate::row::Row>) -> (Vec<LogicalLine>, Vec<(usize, usize)>) {
+    let default = crate::Cell::new();
+    let mut lines = Vec::new();
+    let mut locations = Vec::with_capacity(rows.len());
+    let mut current = Vec::new();
+
+    for row in rows {
+        let line = lines.len();
+        locations.push((line, current.len()));
+        let mut cells = row.cells().to_vec();
+        if !row.wrapped() {
+            let end = cells
+                .iter()
+                .rposition(|cell| cell != &default)
+                .map_or(0, |index| index + 1);
+            cells.truncate(end);
+        }
+        current.extend(cells);
+        if !row.wrapped() {
+            lines.push(LogicalLine {
+                cells: std::mem::take(&mut current),
+            });
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(LogicalLine { cells: current });
+    }
+    (lines, locations)
+}
+
+fn reflow_lines(lines: &[LogicalLine], cols: u16) -> (Vec<crate::row::Row>, Vec<usize>) {
+    let width = usize::from(cols.max(1));
+    let mut rows = Vec::new();
+    let mut line_starts = Vec::with_capacity(lines.len());
+    for line in lines {
+        line_starts.push(rows.len());
+        if line.cells.is_empty() {
+            rows.push(crate::row::Row::new(cols.max(1)));
+            continue;
+        }
+
+        let mut current = Vec::new();
+        let mut index = 0;
+        while index < line.cells.len() {
+            let mut unit = vec![line.cells[index].clone()];
+            if line.cells[index].is_wide()
+                && line
+                    .cells
+                    .get(index + 1)
+                    .is_some_and(crate::Cell::is_wide_continuation)
+            {
+                unit.push(line.cells[index + 1].clone());
+                index += 1;
+            }
+            if unit.len() > width {
+                let mut cell = unit.remove(0);
+                cell.set_wide(false);
+                if !current.is_empty() {
+                    current.resize(width, crate::Cell::new());
+                    rows.push(crate::row::Row::from_cells(current, true));
+                    current = Vec::new();
+                }
+                current.push(cell);
+            } else {
+                if current.len() + unit.len() > width {
+                    current.resize(width, crate::Cell::new());
+                    rows.push(crate::row::Row::from_cells(current, true));
+                    current = Vec::new();
+                }
+                current.extend(unit);
+            }
+            index += 1;
+        }
+        current.resize(width, crate::Cell::new());
+        rows.push(crate::row::Row::from_cells(current, false));
+    }
+    (rows, line_starts)
+}
+
+fn map_position(
+    old_history_len: usize,
+    pos: Pos,
+    locations: &[(usize, usize)],
+    line_starts: &[usize],
+    visible_start: usize,
+    size: Size,
+) -> Pos {
+    let old_row = old_history_len.saturating_add(usize::from(pos.row));
+    let (line, row_offset) = locations
+        .get(old_row.min(locations.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or_default();
+    let offset = row_offset.saturating_add(usize::from(pos.col));
+    let global_row = line_starts
+        .get(line)
+        .copied()
+        .unwrap_or(visible_start)
+        .saturating_add(offset / usize::from(size.cols));
+    Pos {
+        row: global_row
+            .saturating_sub(visible_start)
+            .min(usize::from(size.rows - 1))
+            .try_into()
+            .unwrap_or(size.rows - 1),
+        col: (offset % usize::from(size.cols))
+            .try_into()
+            .unwrap_or(size.cols - 1),
+    }
+}
+
+struct LogicalLine {
+    cells: Vec<crate::Cell>,
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]

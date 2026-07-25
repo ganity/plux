@@ -111,6 +111,16 @@ impl Screen {
         self.grid_mut().set_scrollback(rows);
     }
 
+    /// Sets the maximum number of rows retained in the primary scrollback.
+    pub fn set_scrollback_len(&mut self, len: usize) {
+        self.grid_mut().set_scrollback_len(len);
+    }
+
+    /// Returns the configured maximum number of primary scrollback rows.
+    pub fn scrollback_len(&self) -> usize {
+        self.grid().scrollback_len()
+    }
+
     /// Returns the current position in the scrollback.
     ///
     /// This position indicates the offset from the top of the screen, and is

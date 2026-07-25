@@ -1,10 +1,13 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs, io,
     net::Shutdown,
     os::unix::fs::PermissionsExt,
     os::unix::net::{UnixListener, UnixStream},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -24,8 +27,13 @@ use crate::{
     socket::{remove_socket, set_private_socket, socket_path},
 };
 
-const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
+const CLIENT_OUTPUT_QUEUE_CAPACITY: usize = 64;
+const CONTROL_EVENT_CAPACITY: usize = 256;
+const PANE_EVENT_CAPACITY: usize = 128;
+const CONTROL_EVENT_BUDGET: usize = 64;
+const PANE_EVENT_BUDGET: usize = 64;
 
 enum Event {
     ClientMessage {
@@ -33,16 +41,17 @@ enum Event {
         message: ClientMessage,
     },
     ClientDisconnected(u64),
-    Pane(PaneEvent),
-    Shutdown,
+    SnapshotWritten(u64),
+    ClientWriteFailed(u64),
 }
 
 struct Client {
     id: u64,
     token: Option<String>,
-    last_seen: Instant,
-    writer: Arc<Mutex<UnixStream>>,
+    last_seen: Arc<Mutex<Instant>>,
+    writer: Arc<ClientWriter>,
     session: Option<String>,
+    snapshot_in_flight: bool,
 }
 
 struct SearchTask {
@@ -59,6 +68,87 @@ struct PendingExit {
     pane_id: u64,
     status: String,
     session_finished: bool,
+}
+
+struct PendingResize {
+    rows: u16,
+    cols: u16,
+    requested_at: Instant,
+}
+
+struct QueuedMessage {
+    message: ServerMessage,
+    snapshot: bool,
+}
+
+struct WriterState {
+    queue: VecDeque<QueuedMessage>,
+    writing: bool,
+    closed: bool,
+}
+
+struct ClientWriter {
+    stream: Mutex<UnixStream>,
+    state: Mutex<WriterState>,
+    wake: Condvar,
+}
+
+impl ClientWriter {
+    fn new(
+        stream: UnixStream,
+        events: mpsc::SyncSender<Event>,
+        client_id: u64,
+    ) -> Result<Arc<Self>> {
+        let writer = Arc::new(Self {
+            stream: Mutex::new(stream),
+            state: Mutex::new(WriterState {
+                queue: VecDeque::new(),
+                writing: false,
+                closed: false,
+            }),
+            wake: Condvar::new(),
+        });
+        let worker = writer.clone();
+        thread::Builder::new()
+            .name("plux-client-writer".to_string())
+            .spawn(move || client_writer(worker, events, client_id))?;
+        Ok(writer)
+    }
+
+    fn enqueue(&self, message: ServerMessage, snapshot: bool) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "client writer lock poisoned")?;
+        if state.closed {
+            return Err("client writer is closed".into());
+        }
+        if state.queue.len() >= CLIENT_OUTPUT_QUEUE_CAPACITY {
+            return Err("client output queue is full".into());
+        }
+        state.queue.push_back(QueuedMessage { message, snapshot });
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    fn wait_idle(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        while state.writing || !state.queue.is_empty() {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            self.wake.notify_all();
+        }
+    }
 }
 
 impl SearchTask {
@@ -90,16 +180,19 @@ struct Daemon {
     listener: UnixListener,
     socket_path: std::path::PathBuf,
     sessions: HashMap<String, Session>,
-    events_tx: mpsc::Sender<Event>,
+    events_tx: mpsc::SyncSender<Event>,
     events_rx: mpsc::Receiver<Event>,
-    pane_events_tx: mpsc::Sender<PaneEvent>,
+    pane_events_tx: mpsc::SyncSender<PaneEvent>,
+    pane_events_rx: mpsc::Receiver<PaneEvent>,
     client: Option<Client>,
     next_client_id: u64,
     next_pane_id: u64,
+    pending_resizes: HashMap<String, PendingResize>,
     pending_snapshots: HashSet<String>,
     pending_exits: Vec<PendingExit>,
     last_snapshot: Instant,
     search_task: Option<SearchTask>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl Daemon {
@@ -129,9 +222,10 @@ impl Daemon {
         };
         set_private_socket(&socket_path)?;
         listener.set_nonblocking(true)?;
-        let (events_tx, events_rx) = mpsc::channel();
-        let (pane_events_tx, pane_events_rx) = mpsc::channel();
-        let signal_events = events_tx.clone();
+        let (events_tx, events_rx) = mpsc::sync_channel(CONTROL_EVENT_CAPACITY);
+        let (pane_events_tx, pane_events_rx) = mpsc::sync_channel(PANE_EVENT_CAPACITY);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let signal_shutdown = shutdown_requested.clone();
         thread::Builder::new()
             .name("plux-signal-reader".to_string())
             .spawn(move || {
@@ -139,20 +233,9 @@ impl Daemon {
                     return;
                 };
                 if signals.forever().next().is_some() {
-                    let _ = signal_events.send(Event::Shutdown);
+                    signal_shutdown.store(true, Ordering::Release);
                 }
             })?;
-        let pane_events_forwarder = events_tx.clone();
-        thread::Builder::new()
-            .name("plux-pane-events".to_string())
-            .spawn(move || {
-                for event in pane_events_rx {
-                    if pane_events_forwarder.send(Event::Pane(event)).is_err() {
-                        return;
-                    }
-                }
-            })?;
-
         Ok(Self {
             config,
             listener,
@@ -161,13 +244,16 @@ impl Daemon {
             events_tx,
             events_rx,
             pane_events_tx,
+            pane_events_rx,
             client: None,
             next_client_id: 1,
             next_pane_id: 1,
+            pending_resizes: HashMap::new(),
             pending_snapshots: HashSet::new(),
             pending_exits: Vec::new(),
             last_snapshot: Instant::now(),
             search_task: None,
+            shutdown_requested,
         })
     }
 
@@ -180,22 +266,28 @@ impl Daemon {
     fn event_loop(&mut self) -> Result<()> {
         loop {
             self.expire_stale_client();
+            if self.shutdown_requested.load(Ordering::Acquire) {
+                self.wait_for_client_writer();
+                self.shutdown_sessions();
+                return Ok(());
+            }
             self.accept_client()?;
             match self.events_rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(Event::Shutdown) => {
-                    self.shutdown_sessions();
-                    return Ok(());
-                }
                 Ok(event) => self.handle_event(event)?,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
-            while let Ok(event) = self.events_rx.try_recv() {
-                if matches!(event, Event::Shutdown) {
-                    self.shutdown_sessions();
-                    return Ok(());
-                }
+            for _ in 1..CONTROL_EVENT_BUDGET {
+                let Ok(event) = self.events_rx.try_recv() else {
+                    break;
+                };
                 self.handle_event(event)?;
+            }
+            for _ in 0..PANE_EVENT_BUDGET {
+                let Ok(event) = self.pane_events_rx.try_recv() else {
+                    break;
+                };
+                self.handle_pane_event(event)?;
             }
             self.process_search_step()?;
             self.flush_snapshots()?;
@@ -262,7 +354,46 @@ impl Daemon {
         self.send_attached_snapshot()
     }
 
+    fn cancel_search(&mut self) -> Result<()> {
+        let Some(task) = self.search_task.take() else {
+            return Ok(());
+        };
+        if let Some(session) = self.sessions.get_mut(&task.session_name) {
+            if let Some(pane) = session.panes.get_mut(&session.focused) {
+                pane.terminal.set_scrollback(task.original);
+            }
+        }
+        Ok(())
+    }
+
     fn flush_snapshots(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let ready = self
+            .pending_resizes
+            .iter()
+            .filter(|(_, resize)| now.duration_since(resize.requested_at) >= RESIZE_DEBOUNCE)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for name in ready {
+            let Some(resize) = self.pending_resizes.remove(&name) else {
+                continue;
+            };
+            if let Some(session) = self.sessions.get_mut(&name) {
+                session.resize(resize.rows, resize.cols)?;
+                self.pending_snapshots.insert(name);
+            }
+        }
+        if !self.pending_resizes.is_empty() {
+            return Ok(());
+        }
+        if self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.snapshot_in_flight)
+        {
+            return Ok(());
+        }
+
         let interval =
             Duration::from_micros(1_000_000_u64 / u64::from(self.config.refresh_rate.max(1)));
         if self.pending_snapshots.is_empty() && self.pending_exits.is_empty()
@@ -311,14 +442,8 @@ impl Daemon {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) => return Err(error.into()),
         };
-        accepted.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
-
-        if self.client.is_none() {
-            self.install_client(accepted, None)?;
-            return Ok(());
-        }
-
         let mut stream = accepted;
+        let had_client = self.client.is_some();
         stream.set_read_timeout(Some(Duration::from_millis(100)))?;
         let message = read_message::<_, ClientMessage>(&mut stream).ok().flatten();
         stream.set_read_timeout(None)?;
@@ -333,12 +458,7 @@ impl Daemon {
                     .and_then(|_| validate_name(&name))
                     .and_then(|_| self.validate_attach_target(&name))
                 {
-                    let _ = write_message(
-                        &mut stream,
-                        &ServerMessage::Error {
-                            message: error.to_string(),
-                        },
-                    );
+                    self.reject_client(stream, error.to_string());
                     return Ok(());
                 }
                 let same_client = self
@@ -346,7 +466,7 @@ impl Daemon {
                     .as_ref()
                     .and_then(|client| client.token.as_deref())
                     == Some(client_token.as_str());
-                if same_client || self.client_lease_expired() {
+                if !had_client || same_client || self.client_lease_expired() {
                     self.replace_client(
                         stream,
                         ClientMessage::Attach {
@@ -376,12 +496,7 @@ impl Daemon {
                     .and_then(|_| validate_name(&name))
                     .and_then(|_| self.validate_attach_target(&name))
                 {
-                    let _ = write_message(
-                        &mut stream,
-                        &ServerMessage::Error {
-                            message: error.to_string(),
-                        },
-                    );
+                    self.reject_client(stream, error.to_string());
                     return Ok(());
                 }
                 self.replace_client(
@@ -401,6 +516,14 @@ impl Daemon {
             | Some(message @ ClientMessage::Shutdown) => {
                 self.handle_short_request(stream, message)?;
             }
+            _ if !had_client => {
+                let _ = write_message(
+                    &mut stream,
+                    &ServerMessage::Error {
+                        message: "expected Attach or Takeover as the first message".to_string(),
+                    },
+                );
+            }
             _ => {
                 let _ = write_message(
                     &mut stream,
@@ -413,21 +536,37 @@ impl Daemon {
         Ok(())
     }
 
+    fn reject_client(&self, mut stream: UnixStream, message: String) {
+        let _ = write_message(&mut stream, &ServerMessage::Error { message });
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        if matches!(
+            read_message::<_, ClientMessage>(&mut stream),
+            Ok(Some(ClientMessage::Detach))
+        ) {
+            let _ = write_message(&mut stream, &ServerMessage::Detached);
+        }
+    }
+
     fn install_client(&mut self, stream: UnixStream, token: Option<String>) -> Result<u64> {
         let reader = stream.try_clone()?;
-        let writer = Arc::new(Mutex::new(stream));
         let events = self.events_tx.clone();
         let client_id = self.next_client_id;
         self.next_client_id += 1;
+        let last_seen = Arc::new(Mutex::new(Instant::now()));
+        let writer = ClientWriter::new(stream, events.clone(), client_id)?;
         thread::Builder::new()
             .name("plux-client-reader".to_string())
-            .spawn(move || client_reader(reader, events, client_id))?;
+            .spawn({
+                let last_seen = last_seen.clone();
+                move || client_reader(reader, events, client_id, last_seen)
+            })?;
         self.client = Some(Client {
             id: client_id,
             token,
-            last_seen: Instant::now(),
+            last_seen,
             writer,
             session: None,
+            snapshot_in_flight: false,
         });
         Ok(client_id)
     }
@@ -468,19 +607,25 @@ impl Daemon {
         }
 
         let active = self.client.take();
+        let writer = ClientWriter::new(stream, self.events_tx.clone(), u64::MAX)?;
+        let writer_handle = writer.clone();
         self.client = Some(Client {
             id: u64::MAX,
             token: None,
-            last_seen: Instant::now(),
-            writer: Arc::new(Mutex::new(stream)),
+            last_seen: Arc::new(Mutex::new(Instant::now())),
+            writer,
             session: None,
+            snapshot_in_flight: false,
         });
         if let Err(error) = self.handle_client_message(message) {
             let _ = self.send(ServerMessage::Error {
                 message: error.to_string(),
             });
         }
-        self.detach_client();
+        writer_handle.wait_idle();
+        if self.client.is_some() {
+            self.detach_client();
+        }
         self.client = active;
         Ok(())
     }
@@ -494,9 +639,6 @@ impl Daemon {
                     .is_none_or(|client| client.id != client_id)
                 {
                     return Ok(());
-                }
-                if let Some(client) = self.client.as_mut() {
-                    client.last_seen = Instant::now();
                 }
                 if let Err(error) = self.handle_client_message(message) {
                     let _ = self.send(ServerMessage::Error {
@@ -516,16 +658,21 @@ impl Daemon {
                 }
                 Ok(())
             }
-            Event::Pane(event) => {
-                if let Err(error) = self.handle_pane_event(event) {
-                    let _ = self.send(ServerMessage::Error {
-                        message: error.to_string(),
-                    });
+            Event::SnapshotWritten(client_id) => {
+                if let Some(client) = self.client.as_mut().filter(|client| client.id == client_id) {
+                    client.snapshot_in_flight = false;
                 }
                 Ok(())
             }
-            Event::Shutdown => {
-                self.shutdown_sessions();
+            Event::ClientWriteFailed(client_id) => {
+                if self
+                    .client
+                    .as_ref()
+                    .is_some_and(|client| client.id == client_id)
+                {
+                    self.detach_client();
+                    self.cleanup_finished_temporary();
+                }
                 Ok(())
             }
         }
@@ -554,8 +701,11 @@ impl Daemon {
             self.detach_client();
             return result;
         }
-        if !matches!(&message, ClientMessage::Search { .. }) {
-            self.search_task = None;
+        if !matches!(
+            &message,
+            ClientMessage::Search { .. } | ClientMessage::Heartbeat
+        ) {
+            self.cancel_search()?;
         }
         match message {
             ClientMessage::Create {
@@ -622,6 +772,7 @@ impl Daemon {
             }
             ClientMessage::Kill { name } => {
                 validate_name(&name)?;
+                self.pending_resizes.remove(&name);
                 if let Some(mut session) = self.sessions.remove(&name) {
                     for pane in session.panes.values_mut() {
                         let _ = pane.kill();
@@ -643,15 +794,13 @@ impl Daemon {
             }
             ClientMessage::Shutdown => {
                 self.send(ServerMessage::Ok)?;
-                self.events_tx
-                    .send(Event::Shutdown)
-                    .map_err(|_| "daemon event channel closed")?;
+                self.shutdown_requested.store(true, Ordering::Release);
                 Ok(())
             }
             ClientMessage::Input { bytes } => {
                 if let Some(session) = self.attached_session_mut() {
                     if let Some(pane) = session.focused_pane_mut() {
-                        pane.write_input(&bytes)?;
+                        pane.write_input_owned(bytes)?;
                     }
                 }
                 Ok(())
@@ -659,10 +808,14 @@ impl Daemon {
             ClientMessage::Resize { rows, cols } => {
                 let session_name = self.attached_session_name();
                 if let Some(name) = session_name {
-                    if let Some(session) = self.sessions.get_mut(&name) {
-                        session.resize(rows, cols)?;
-                        self.pending_snapshots.insert(name);
-                    }
+                    self.pending_resizes.insert(
+                        name,
+                        PendingResize {
+                            rows,
+                            cols,
+                            requested_at: Instant::now(),
+                        },
+                    );
                 }
                 Ok(())
             }
@@ -687,6 +840,7 @@ impl Daemon {
                 self.send_attached_snapshot()
             }
             ClientMessage::Search { query, direction } => {
+                self.cancel_search()?;
                 let session_name = self.attached_session_name().ok_or("no attached session")?;
                 let (original, maximum) = self.with_focused_pane(|pane| {
                     let original = pane.terminal.screen().scrollback();
@@ -749,6 +903,7 @@ impl Daemon {
                     .get(&name)
                     .is_some_and(|session| session.panes.len() == 1);
                 if close_session {
+                    self.pending_resizes.remove(&name);
                     if let Some(mut session) = self.sessions.remove(&name) {
                         for pane in session.panes.values_mut() {
                             let _ = pane.kill();
@@ -783,6 +938,7 @@ impl Daemon {
                 if let Some(client) = self.client.as_mut() {
                     client.session = Some(name.clone());
                 }
+                self.pending_resizes.remove(&old_name);
                 self.remove_metadata(&old_name)?;
                 self.persist_session(&name)?;
                 self.send_attached_snapshot()
@@ -1012,10 +1168,25 @@ impl Daemon {
         let Some(name) = self.attached_session_name() else {
             return Ok(());
         };
+        if self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.snapshot_in_flight)
+        {
+            self.pending_snapshots.insert(name);
+            return Ok(());
+        }
         self.send_snapshot(&name)
     }
 
     fn send_snapshot(&mut self, session_name: &str) -> Result<()> {
+        if self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.snapshot_in_flight)
+        {
+            return Ok(());
+        }
         self.pending_snapshots.remove(session_name);
         let Some(session) = self.sessions.get_mut(session_name) else {
             return Ok(());
@@ -1038,24 +1209,35 @@ impl Daemon {
     }
 
     fn send(&mut self, message: ServerMessage) -> Result<()> {
-        let Some(client) = self.client.as_ref() else {
+        let is_snapshot = matches!(message, ServerMessage::Snapshot { .. });
+        let Some((client_id, writer, snapshot_in_flight)) = self
+            .client
+            .as_ref()
+            .map(|client| (client.id, client.writer.clone(), client.snapshot_in_flight))
+        else {
             return Ok(());
         };
-        let result: Result<()> = match client.writer.lock() {
-            Ok(mut writer) => write_message(&mut *writer, &message),
-            Err(_) => Err("client writer lock poisoned".into()),
-        };
-        if result.is_err() {
-            self.detach_client();
+        if is_snapshot && snapshot_in_flight {
+            return Ok(());
         }
-        // A client disappearing is normal during SSH reconnects and must not
-        // terminate the daemon or discard its in-memory sessions.
+        if writer.enqueue(message, is_snapshot).is_err() {
+            self.detach_client();
+            return Ok(());
+        }
+        if is_snapshot {
+            if let Some(client) = self.client.as_mut().filter(|client| client.id == client_id) {
+                client.snapshot_in_flight = true;
+            }
+        }
         Ok(())
     }
 
     fn client_lease_expired(&self) -> bool {
         self.client.as_ref().is_some_and(|client| {
-            client.token.is_some() && client.last_seen.elapsed() >= CLIENT_LEASE_TIMEOUT
+            client.token.is_some()
+                && client.last_seen.lock().map_or(true, |last_seen| {
+                    last_seen.elapsed() >= CLIENT_LEASE_TIMEOUT
+                })
         })
     }
 
@@ -1067,17 +1249,22 @@ impl Daemon {
     }
 
     fn detach_client(&mut self) {
-        self.search_task = None;
+        let _ = self.cancel_search();
         let Some(client) = self.client.take() else {
             return;
         };
-        if let Ok(writer) = client.writer.lock() {
-            let _ = writer.shutdown(Shutdown::Both);
-        }
+        client.writer.close();
         if let Some(name) = client.session {
+            self.pending_resizes.remove(&name);
             if let Some(session) = self.sessions.get_mut(&name) {
                 session.attached = false;
             }
+        }
+    }
+
+    fn wait_for_client_writer(&self) {
+        if let Some(client) = self.client.as_ref() {
+            client.writer.wait_idle();
         }
     }
 
@@ -1089,6 +1276,7 @@ impl Daemon {
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         for name in names {
+            self.pending_resizes.remove(&name);
             if let Some(mut session) = self.sessions.remove(&name) {
                 for pane in session.panes.values_mut() {
                     let _ = pane.kill();
@@ -1099,10 +1287,72 @@ impl Daemon {
     }
 }
 
-fn client_reader(mut reader: UnixStream, events: mpsc::Sender<Event>, client_id: u64) {
+fn client_writer(writer: Arc<ClientWriter>, events: mpsc::SyncSender<Event>, client_id: u64) {
+    loop {
+        let queued = {
+            let Ok(mut state) = writer.state.lock() else {
+                return;
+            };
+            while state.queue.is_empty() && !state.closed {
+                state = writer
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            if state.closed && state.queue.is_empty() {
+                drop(state);
+                if let Ok(stream) = writer.stream.lock() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                return;
+            }
+            state.writing = true;
+            state.queue.pop_front()
+        };
+        let Some(QueuedMessage { message, snapshot }) = queued else {
+            continue;
+        };
+
+        let write_result = writer
+            .stream
+            .lock()
+            .map_err(|_| "client writer lock poisoned".to_string())
+            .and_then(|mut stream| {
+                write_message(&mut *stream, &message).map_err(|error| error.to_string())
+            });
+        if write_result.is_err() {
+            if let Ok(mut state) = writer.state.lock() {
+                state.closed = true;
+                state.writing = false;
+                state.queue.clear();
+                writer.wake.notify_all();
+            }
+            let _ = events.send(Event::ClientWriteFailed(client_id));
+            return;
+        }
+
+        if let Ok(mut state) = writer.state.lock() {
+            state.writing = false;
+            writer.wake.notify_all();
+        }
+        if snapshot {
+            let _ = events.send(Event::SnapshotWritten(client_id));
+        }
+    }
+}
+
+fn client_reader(
+    mut reader: UnixStream,
+    events: mpsc::SyncSender<Event>,
+    client_id: u64,
+    last_seen: Arc<Mutex<Instant>>,
+) {
     loop {
         match read_message::<_, ClientMessage>(&mut reader) {
             Ok(Some(message)) => {
+                if let Ok(mut arrival) = last_seen.lock() {
+                    *arrival = Instant::now();
+                }
                 if events
                     .send(Event::ClientMessage { client_id, message })
                     .is_err()

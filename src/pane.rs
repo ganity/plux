@@ -1,8 +1,9 @@
 use std::{
+    collections::VecDeque,
     env,
     io::{Read, Write},
     path::PathBuf,
-    sync::{mpsc::Sender, Arc, Condvar, Mutex},
+    sync::{mpsc::SyncSender, Arc, Condvar, Mutex},
     thread,
 };
 
@@ -12,6 +13,7 @@ use crate::{config::Config, error::Result, terminal::TerminalState};
 
 pub const DEFAULT_ROWS: u16 = 24;
 pub const DEFAULT_COLS: u16 = 80;
+const MAX_INPUT_BACKLOG: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub enum PaneEvent {
@@ -29,8 +31,63 @@ pub struct Pane {
     pub process_id: Option<u32>,
     pub cwd: PathBuf,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    writer: Box<dyn Write + Send>,
+    input: Arc<PaneInput>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+}
+
+struct PaneInputState {
+    queue: VecDeque<Vec<u8>>,
+    bytes: usize,
+    closed: bool,
+}
+
+struct PaneInput {
+    state: Mutex<PaneInputState>,
+    wake: Condvar,
+}
+
+impl PaneInput {
+    fn spawn(writer: Box<dyn Write + Send>) -> Result<Arc<Self>> {
+        let input = Arc::new(Self {
+            state: Mutex::new(PaneInputState {
+                queue: VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            wake: Condvar::new(),
+        });
+        let worker = input.clone();
+        thread::Builder::new()
+            .name("plux-pane-writer".to_string())
+            .spawn(move || pane_input_writer(worker, writer))?;
+        Ok(input)
+    }
+
+    fn enqueue(&self, bytes: Vec<u8>) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.state.lock().map_err(|_| "pane input lock poisoned")?;
+        if state.closed {
+            return Err("pane input writer is closed".into());
+        }
+        if state.bytes.saturating_add(bytes.len()) > MAX_INPUT_BACKLOG {
+            return Err("pane input backlog exceeded".into());
+        }
+        state.bytes += bytes.len();
+        state.queue.push_back(bytes);
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            state.queue.clear();
+            state.bytes = 0;
+            self.wake.notify_all();
+        }
+    }
 }
 
 impl Pane {
@@ -41,7 +98,7 @@ impl Pane {
         cols: u16,
         session_name: &str,
         command: Option<Vec<String>>,
-        events: Sender<PaneEvent>,
+        events: SyncSender<PaneEvent>,
     ) -> Result<Self> {
         let rows = rows.max(2);
         let cols = cols.max(1);
@@ -90,6 +147,7 @@ impl Pane {
             .lock()
             .map_err(|_| "PTY master lock poisoned")?
             .take_writer()?;
+        let input = PaneInput::spawn(writer)?;
 
         let exit_state = Arc::new((Mutex::new(None), Condvar::new()));
         spawn_reader(id, reader, events.clone(), exit_state.clone());
@@ -107,20 +165,21 @@ impl Pane {
             process_id,
             cwd,
             master,
-            writer,
+            input,
             killer,
         })
     }
 
-    pub fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()?;
-        Ok(())
+    pub fn write_input_owned(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.input.enqueue(bytes)
     }
 
     pub fn process_output(&mut self, bytes: &[u8]) {
         let was_scrolled = self.terminal.is_scrolled();
         self.terminal.process(bytes);
+        for reply in self.terminal.take_replies() {
+            let _ = self.write_input_owned(reply);
+        }
         if was_scrolled {
             let lines = bytes.iter().filter(|byte| **byte == b'\n').count().max(1);
             self.unread_output = self.unread_output.saturating_add(lines);
@@ -153,10 +212,45 @@ impl Pane {
     }
 }
 
+impl Drop for Pane {
+    fn drop(&mut self) {
+        self.input.close();
+    }
+}
+
+fn pane_input_writer(input: Arc<PaneInput>, mut writer: Box<dyn Write + Send>) {
+    loop {
+        let bytes = {
+            let Ok(mut state) = input.state.lock() else {
+                return;
+            };
+            while state.queue.is_empty() && !state.closed {
+                state = input
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            if state.closed && state.queue.is_empty() {
+                return;
+            }
+            let bytes = state
+                .queue
+                .pop_front()
+                .expect("pane input queue is non-empty");
+            state.bytes = state.bytes.saturating_sub(bytes.len());
+            bytes
+        };
+        if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+            input.close();
+            return;
+        }
+    }
+}
+
 fn spawn_reader(
     pane_id: u64,
     mut reader: Box<dyn Read + Send>,
-    events: Sender<PaneEvent>,
+    events: SyncSender<PaneEvent>,
     exit_state: ExitState,
 ) {
     thread::Builder::new()
@@ -218,7 +312,7 @@ fn spawn_waiter(
         .expect("failed to spawn PTY waiter thread");
 }
 
-fn send_exit_event(pane_id: u64, events: &Sender<PaneEvent>, exit_state: &ExitState) {
+fn send_exit_event(pane_id: u64, events: &SyncSender<PaneEvent>, exit_state: &ExitState) {
     let (lock, wake) = &**exit_state;
     let mut status = lock.lock().unwrap_or_else(|error| error.into_inner());
     while status.is_none() {
@@ -238,10 +332,11 @@ mod tests {
 
     #[test]
     fn shell_writes_to_terminal() {
-        let (events_tx, events_rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::sync_channel(128);
         let config = Config::default();
         let mut pane = Pane::spawn_with_session(1, &config, 8, 80, "", None, events_tx).unwrap();
-        pane.write_input(b"printf 'pane-ok\\n'\r").unwrap();
+        pane.write_input_owned(b"printf 'pane-ok\\n'\r".to_vec())
+            .unwrap();
 
         let mut output = Vec::new();
         for _ in 0..10 {
@@ -262,8 +357,35 @@ mod tests {
     }
 
     #[test]
+    fn terminal_query_reply_reaches_child_pty() {
+        let (events_tx, events_rx) = mpsc::sync_channel(128);
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            r#"stty raw -echo; printf '\033[5n'; response=$(dd bs=4 count=1 2>/dev/null | od -An -t x1); stty sane; case "$response" in *"1b 5b 30 6e"*) printf 'DSR_OK\n';; esac"#.to_string(),
+        ];
+        let mut pane =
+            Pane::spawn_with_session(3, &Config::default(), 8, 80, "", Some(command), events_tx)
+                .unwrap();
+
+        for _ in 0..10 {
+            match events_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+                PaneEvent::Output { bytes, .. } => {
+                    pane.process_output(&bytes);
+                    if pane.terminal.contents().contains("DSR_OK") {
+                        return;
+                    }
+                }
+                PaneEvent::ReaderError { error, .. } => panic!("PTY reader failed: {error}"),
+                PaneEvent::Exited { .. } => {}
+            }
+        }
+        panic!("terminal query reply did not reach child");
+    }
+
+    #[test]
     fn kill_does_not_wait_for_the_child_waiter_lock() {
-        let (events_tx, events_rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::sync_channel(128);
         let mut pane =
             Pane::spawn_with_session(2, &Config::default(), 8, 80, "", None, events_tx).unwrap();
         pane.kill().unwrap();
@@ -275,7 +397,7 @@ mod tests {
 
     #[test]
     fn exit_event_follows_final_output() {
-        let (events_tx, events_rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::sync_channel(128);
         let _pane = Pane::spawn_with_session(
             3,
             &Config::default(),

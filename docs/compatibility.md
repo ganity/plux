@@ -13,8 +13,12 @@ creation is delegated to `portable-pty`.
 - 1000-line PTY output with scrollback, search, copy request and unread output.
 - Vertical/horizontal split, focus, zoom, ratio adjustment and pane close.
 - SGR mouse wheel routing and application mouse capture forwarding.
-- Snapshot rendering coalesces pending refreshes, uses row-level updates after the
-  initial frame, and disconnects slow clients after a bounded write timeout.
+- Snapshot rendering preserves frame order, coalesces only pending state, uses
+  row-level updates after the initial frame, and applies bounded backpressure to
+  slow clients without blocking daemon control requests.
+- Real client PTY attach/input/detach, SIGWINCH resize bursts, large resize
+  drags, pane-safe split rendering, scrollback resize preservation and common
+  terminal query replies are covered by automated tests.
 - SIGTERM cleanup, 0-size pseudo-terminal clamping and private metadata.
 - Protocol bridge forwarding, client-token reconnect takeover, Heartbeat Ack and
   stale-connection event filtering through the daemon lifecycle tests.
@@ -34,5 +38,17 @@ smoke test remains pending.
 - GBK/Big5 detection, terminal graphics protocols, Windows, direct TCP listeners
   and plugins are outside the current scope. Remote attach is supported through
   the SSH bridge described in the README.
-- History search still scans the vt100 scrollback synchronously; very large histories
-  can briefly occupy the daemon while a search is running.
+- History search advances in bounded daemon steps; very large histories still
+  require more steps and may take longer to complete.
+
+## Terminal Query Replies
+
+Plux responds to the common query set used by shells and full-screen programs:
+
+- `CSI 5 n` status OK;
+- `CSI 6 n` cursor position;
+- primary and secondary device attributes;
+- `CSI 18 t` character-cell window size.
+
+Graphics protocols, OSC 52 clipboard requests from child applications, title
+forwarding and other unsupported queries remain outside the compatibility claim.

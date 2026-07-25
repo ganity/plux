@@ -69,6 +69,7 @@ impl TestDaemon {
     fn wait_for_socket(&self) {
         for _ in 0..100 {
             if UnixStream::connect(self.socket_path()).is_ok() {
+                thread::sleep(Duration::from_millis(50));
                 return;
             }
             thread::sleep(Duration::from_millis(10));
@@ -195,6 +196,111 @@ fn resize_burst_is_coalesced_without_detaching_client() {
 
     write_message(&mut attached, &ClientMessage::Detach).unwrap();
     wait_for_detached(&mut attached);
+}
+
+#[test]
+fn resize_burst_applies_only_the_final_pty_size() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "resize-winch",
+        vec!["/bin/sh".to_string(), "-i".to_string()],
+    );
+
+    let (mut attached, initial) = test.attach_with_snapshot("resize-winch");
+    attached
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut startup = initial;
+    write_message(
+        &mut attached,
+        &ClientMessage::Input {
+            bytes: b"printf READY\\n\r".to_vec(),
+        },
+    )
+    .unwrap();
+    while !startup.contains("READY") {
+        match next_server(&mut attached) {
+            ServerMessage::Snapshot { data, .. } => startup.push_str(&data),
+            response => panic!("unexpected startup response: {response:?}"),
+        }
+    }
+    for index in 0..100 {
+        write_message(
+            &mut attached,
+            &ClientMessage::Resize {
+                rows: if index % 2 == 0 { 8 } else { 48 },
+                cols: if index % 2 == 0 { 20 } else { 160 },
+            },
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(5));
+    }
+    write_message(&mut attached, &ClientMessage::Resize { rows: 31, cols: 97 }).unwrap();
+    thread::sleep(Duration::from_secs(1));
+    write_message(
+        &mut attached,
+        &ClientMessage::Input {
+            bytes: b"stty size; printf FINAL\\n\r".to_vec(),
+        },
+    )
+    .unwrap();
+    write_message(&mut attached, &ClientMessage::Heartbeat).unwrap();
+
+    let mut snapshot_count = 0;
+    let mut rendered = String::new();
+    let mut saw_final_size = false;
+    let mut saw_final_output = false;
+    let mut saw_heartbeat = false;
+    while !saw_final_size || !saw_final_output || !saw_heartbeat {
+        match next_server(&mut attached) {
+            ServerMessage::Snapshot {
+                rows, cols, data, ..
+            } => {
+                snapshot_count += 1;
+                rendered.push_str(&data);
+                saw_final_size |= (rows, cols) == (31, 97);
+                saw_final_output |= rendered.contains("31 97") && rendered.contains("FINAL");
+            }
+            ServerMessage::HeartbeatAck => saw_heartbeat = true,
+            response => panic!("unexpected resize response: {response:?}"),
+        }
+    }
+    assert!(
+        snapshot_count <= 4,
+        "resize burst produced {snapshot_count} snapshots"
+    );
+}
+
+#[test]
+fn blocked_child_input_is_bounded_without_blocking_short_requests() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "blocked-input",
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 30".to_string(),
+        ],
+    );
+    let mut attached = test.attach("blocked-input");
+    attached
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write_message(
+        &mut attached,
+        &ClientMessage::Input {
+            bytes: vec![b'x'; 1024 * 1024 + 1],
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        next_server(&mut attached),
+        ServerMessage::Error { message } if message.contains("pane input backlog exceeded")
+    ));
+    let started = std::time::Instant::now();
+    let listed = test.cli(&["list"]);
+    assert!(listed.status.success(), "short request failed: {listed:?}");
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 #[test]
@@ -443,6 +549,35 @@ fn same_client_token_reconnects_and_heartbeats() {
 }
 
 #[test]
+fn repeated_same_token_reconnects_leave_one_client() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "reconnect-loop"]).status.success());
+
+    let (mut current, _) = test.attach_with_token("reconnect-loop", FIRST_CLIENT_TOKEN);
+    for _ in 0..10 {
+        current
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let (mut next, _) = test.attach_with_token("reconnect-loop", FIRST_CLIENT_TOKEN);
+        let mut closed = [0_u8; 1];
+        loop {
+            if current.read(&mut closed).unwrap() == 0 {
+                break;
+            }
+        }
+        write_message(&mut next, &ClientMessage::Heartbeat).unwrap();
+        assert!(matches!(
+            next_server(&mut next),
+            ServerMessage::HeartbeatAck
+        ));
+        current = next;
+    }
+
+    write_message(&mut current, &ClientMessage::Detach).unwrap();
+    wait_for_detached(&mut current);
+}
+
+#[test]
 fn bridge_forwards_protocol_without_extra_output() {
     let test = TestDaemon::start();
     let mut bridge = Command::new(env!("CARGO_BIN_EXE_plux"))
@@ -542,6 +677,12 @@ fn unauthenticated_interactive_client_cannot_hold_attach_slot() {
         ServerMessage::Error { .. }
     ));
     drop(invalid);
+
+    let _silent = UnixStream::connect(test.socket_path()).unwrap();
+    thread::sleep(Duration::from_millis(150));
+    let mut partial = UnixStream::connect(test.socket_path()).unwrap();
+    partial.write_all(&[0, 3]).unwrap();
+    thread::sleep(Duration::from_millis(150));
 
     let mut attached = test.attach("work");
     write_message(&mut attached, &ClientMessage::Detach).unwrap();
@@ -831,6 +972,71 @@ fn search_completes_without_blocking_the_client_protocol() {
         }
     }
     assert!(found, "search did not return a positive result");
+
+    write_message(&mut attached, &ClientMessage::Detach).unwrap();
+    wait_for_detached(&mut attached);
+}
+
+#[test]
+fn heartbeat_does_not_cancel_search() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "search-heartbeat"]).status.success());
+    let mut attached = test.attach("search-heartbeat");
+
+    write_message(
+        &mut attached,
+        &ClientMessage::Search {
+            query: "not-present".to_string(),
+            direction: 1,
+        },
+    )
+    .unwrap();
+    write_message(&mut attached, &ClientMessage::Heartbeat).unwrap();
+
+    let mut found_result = false;
+    let mut heartbeat = false;
+    for _ in 0..10 {
+        match next_server(&mut attached) {
+            ServerMessage::SearchResult { found: false } => found_result = true,
+            ServerMessage::HeartbeatAck => heartbeat = true,
+            _ => {}
+        }
+        if found_result && heartbeat {
+            break;
+        }
+    }
+    assert!(found_result, "search result was cancelled by heartbeat");
+    assert!(heartbeat, "heartbeat was not serviced during search");
+
+    write_message(&mut attached, &ClientMessage::Detach).unwrap();
+    wait_for_detached(&mut attached);
+}
+
+#[test]
+fn terminal_query_reaches_child_through_daemon() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "terminal-query",
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            r#"stty raw -echo; printf '\033[5n'; response=$(dd bs=4 count=1 2>/dev/null | od -An -t x1); stty sane; case "$response" in *"1b 5b 30 6e"*) printf 'DSR_DAEMON_OK\n';; esac; sleep 1"#.to_string(),
+        ],
+    );
+    let (mut attached, initial) = test.attach_with_snapshot("terminal-query");
+    let mut saw_marker = initial.contains("DSR_DAEMON_OK");
+    for _ in 0..20 {
+        if saw_marker {
+            break;
+        }
+        if let ServerMessage::Snapshot { data, .. } = next_server(&mut attached) {
+            saw_marker |= data.contains("DSR_DAEMON_OK");
+        }
+    }
+    assert!(
+        saw_marker,
+        "terminal query reply did not reach child through daemon"
+    );
 
     write_message(&mut attached, &ClientMessage::Detach).unwrap();
     wait_for_detached(&mut attached);
