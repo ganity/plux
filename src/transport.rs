@@ -8,7 +8,12 @@ use std::{
     time::Duration,
 };
 
-use crate::{config::Config, error::Result, socket::connect};
+use crate::{
+    config::Config,
+    error::Result,
+    protocol::{read_message, write_message, ClientMessage},
+    socket::connect,
+};
 
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const SSH_STDERR_LIMIT: u64 = 8 * 1024;
@@ -135,12 +140,20 @@ impl Connection {
 }
 
 pub fn bridge(config: &Config, start: bool) -> Result<()> {
+    let first_message = {
+        let mut stdin = io::stdin().lock();
+        read_message::<_, ClientMessage>(&mut stdin)?
+    };
+    let Some(first_message) = first_message else {
+        return Ok(());
+    };
     let stream = if start {
         crate::socket::connect_or_start(config)?
     } else {
         connect(config)?
     };
     let mut socket_writer = stream.try_clone()?;
+    write_message(&mut socket_writer, &first_message)?;
     let mut socket_reader = stream;
     let socket_shutdown = socket_reader.try_clone()?;
     let stdin_thread = std::thread::Builder::new()

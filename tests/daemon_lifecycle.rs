@@ -753,6 +753,7 @@ fn bridge_forwards_protocol_without_extra_output() {
         .unwrap();
     let mut stdin = bridge.stdin.take().unwrap();
     let mut stdout = bridge.stdout.take().unwrap();
+    thread::sleep(Duration::from_millis(200));
     write_message(&mut stdin, &ClientMessage::List).unwrap();
     assert!(matches!(
         next_server(&mut stdout),
