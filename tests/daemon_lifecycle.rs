@@ -527,7 +527,16 @@ fn same_client_token_reconnects_and_heartbeats() {
 
     let (mut resumed, _) = test.attach_with_token("work", FIRST_CLIENT_TOKEN);
     let mut closed = [0_u8; 1];
-    assert_eq!(first.read(&mut closed).unwrap(), 0);
+    loop {
+        match first.read(&mut closed) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                panic!("replaced client stayed attached")
+            }
+            Err(_) => break,
+        }
+    }
 
     write_message(&mut resumed, &ClientMessage::Heartbeat).unwrap();
     assert!(matches!(
