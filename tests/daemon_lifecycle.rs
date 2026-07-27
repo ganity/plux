@@ -27,6 +27,7 @@ struct TestDaemon {
 
 const FIRST_CLIENT_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const SECOND_CLIENT_TOKEN: &str = "fedcba9876543210fedcba9876543210";
+const THIRD_CLIENT_TOKEN: &str = "11111111111111111111111111111111";
 
 impl TestDaemon {
     fn start() -> Self {
@@ -516,6 +517,150 @@ fn takeover_closes_previous_client_connection() {
 }
 
 #[test]
+fn takeover_of_other_session_keeps_existing_client_connection() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "work"]).status.success());
+    assert!(test.cli(&["new", "web"]).status.success());
+
+    let mut work = test.attach("work");
+    work.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+
+    let mut web = UnixStream::connect(test.socket_path()).unwrap();
+    write_message(
+        &mut web,
+        &ClientMessage::Takeover {
+            name: "web".to_string(),
+            rows: 24,
+            cols: 80,
+            client_token: SECOND_CLIENT_TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        next_server(&mut web),
+        ServerMessage::Attached { .. }
+    ));
+    assert!(matches!(
+        next_server(&mut web),
+        ServerMessage::Snapshot { .. }
+    ));
+
+    write_message(&mut work, &ClientMessage::Heartbeat).unwrap();
+    assert!(matches!(
+        next_server(&mut work),
+        ServerMessage::HeartbeatAck
+    ));
+    write_message(&mut web, &ClientMessage::Heartbeat).unwrap();
+    assert!(matches!(next_server(&mut web), ServerMessage::HeartbeatAck));
+}
+
+#[test]
+fn takeover_replaces_only_the_target_session_client() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "work"]).status.success());
+    assert!(test.cli(&["new", "web"]).status.success());
+
+    let (mut old_work, _) = test.attach_with_token("work", FIRST_CLIENT_TOKEN);
+    let (mut web, _) = test.attach_with_token("web", SECOND_CLIENT_TOKEN);
+    old_work
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+
+    let mut new_work = UnixStream::connect(test.socket_path()).unwrap();
+    write_message(
+        &mut new_work,
+        &ClientMessage::Takeover {
+            name: "work".to_string(),
+            rows: 24,
+            cols: 80,
+            client_token: THIRD_CLIENT_TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        next_server(&mut new_work),
+        ServerMessage::Attached { .. }
+    ));
+    assert!(matches!(
+        next_server(&mut new_work),
+        ServerMessage::Snapshot { .. }
+    ));
+
+    let mut closed = [0_u8; 1];
+    loop {
+        match old_work.read(&mut closed) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                panic!("old target-session client stayed attached")
+            }
+            Err(_) => break,
+        }
+    }
+    write_message(&mut web, &ClientMessage::Heartbeat).unwrap();
+    assert!(matches!(next_server(&mut web), ServerMessage::HeartbeatAck));
+    write_message(&mut new_work, &ClientMessage::Heartbeat).unwrap();
+    assert!(matches!(
+        next_server(&mut new_work),
+        ServerMessage::HeartbeatAck
+    ));
+}
+
+#[test]
+fn different_sessions_receive_their_own_output_and_survive_short_requests() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "work-output",
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 1; printf 'WORK_ONLY\\n'; sleep 30".to_string(),
+        ],
+    );
+    test.create_with_command(
+        "web-output",
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 1; printf 'WEB_ONLY\\n'; sleep 30".to_string(),
+        ],
+    );
+
+    let (mut work, _) = test.attach_with_token("work-output", FIRST_CLIENT_TOKEN);
+    let (mut web, _) = test.attach_with_token("web-output", SECOND_CLIENT_TOKEN);
+    work.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    web.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut work_output = String::new();
+    while !work_output.contains("WORK_ONLY") {
+        if let ServerMessage::Snapshot { data, .. } = next_server(&mut work) {
+            work_output = data;
+        }
+    }
+    let mut web_output = String::new();
+    while !web_output.contains("WEB_ONLY") {
+        if let ServerMessage::Snapshot { data, .. } = next_server(&mut web) {
+            web_output = data;
+        }
+    }
+    assert!(!work_output.contains("WEB_ONLY"));
+    assert!(!web_output.contains("WORK_ONLY"));
+
+    assert!(test.cli(&["list"]).status.success());
+    assert!(test.cli(&["new", "short-request"]).status.success());
+    assert!(test.cli(&["kill", "short-request"]).status.success());
+
+    write_message(&mut work, &ClientMessage::Heartbeat).unwrap();
+    assert!(matches!(
+        next_server(&mut work),
+        ServerMessage::HeartbeatAck
+    ));
+    write_message(&mut web, &ClientMessage::Heartbeat).unwrap();
+    assert!(matches!(next_server(&mut web), ServerMessage::HeartbeatAck));
+}
+
+#[test]
 fn same_client_token_reconnects_and_heartbeats() {
     let test = TestDaemon::start();
     assert!(test.cli(&["new", "work"]).status.success());
@@ -679,6 +824,92 @@ fn bridge_keeps_forwarding_after_interactive_attach() {
     ));
     drop(stdin);
     assert!(bridge.wait().unwrap().success());
+}
+
+#[test]
+fn bridges_can_attach_different_sessions_concurrently() {
+    let test = TestDaemon::start();
+    assert!(test.cli(&["new", "work"]).status.success());
+    assert!(test.cli(&["new", "web"]).status.success());
+
+    let spawn_bridge = || {
+        Command::new(env!("CARGO_BIN_EXE_plux"))
+            .arg("__bridge")
+            .env("XDG_RUNTIME_DIR", &test.runtime)
+            .env("XDG_CONFIG_HOME", &test.config)
+            .env("USER", &test.user)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let mut work_bridge = spawn_bridge();
+    let mut work_in = work_bridge.stdin.take().unwrap();
+    let mut work_out = work_bridge.stdout.take().unwrap();
+    write_message(
+        &mut work_in,
+        &ClientMessage::Takeover {
+            name: "work".to_string(),
+            rows: 24,
+            cols: 80,
+            client_token: FIRST_CLIENT_TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        next_server(&mut work_out),
+        ServerMessage::Attached { .. }
+    ));
+    assert!(matches!(
+        next_server(&mut work_out),
+        ServerMessage::Snapshot { .. }
+    ));
+
+    let mut web_bridge = spawn_bridge();
+    let mut web_in = web_bridge.stdin.take().unwrap();
+    let mut web_out = web_bridge.stdout.take().unwrap();
+    write_message(
+        &mut web_in,
+        &ClientMessage::Takeover {
+            name: "web".to_string(),
+            rows: 24,
+            cols: 80,
+            client_token: SECOND_CLIENT_TOKEN.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        next_server(&mut web_out),
+        ServerMessage::Attached { .. }
+    ));
+    assert!(matches!(
+        next_server(&mut web_out),
+        ServerMessage::Snapshot { .. }
+    ));
+
+    write_message(&mut work_in, &ClientMessage::Heartbeat).unwrap();
+    assert!(matches!(
+        next_server(&mut work_out),
+        ServerMessage::HeartbeatAck
+    ));
+    write_message(&mut web_in, &ClientMessage::Heartbeat).unwrap();
+    assert!(matches!(
+        next_server(&mut web_out),
+        ServerMessage::HeartbeatAck
+    ));
+
+    write_message(&mut work_in, &ClientMessage::Detach).unwrap();
+    assert!(matches!(
+        next_server(&mut work_out),
+        ServerMessage::Detached
+    ));
+    write_message(&mut web_in, &ClientMessage::Detach).unwrap();
+    assert!(matches!(next_server(&mut web_out), ServerMessage::Detached));
+    drop(work_in);
+    drop(web_in);
+    assert!(work_bridge.wait().unwrap().success());
+    assert!(web_bridge.wait().unwrap().success());
 }
 
 #[test]
@@ -991,6 +1222,63 @@ fn search_completes_without_blocking_the_client_protocol() {
 
     write_message(&mut attached, &ClientMessage::Detach).unwrap();
     wait_for_detached(&mut attached);
+}
+
+#[test]
+fn searches_in_different_sessions_complete_independently() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "search-a",
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "for i in $(seq 1 400); do echo alpha-$i; done; sleep 30".to_string(),
+        ],
+    );
+    test.create_with_command(
+        "search-b",
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "for i in $(seq 1 400); do echo beta-$i; done; sleep 30".to_string(),
+        ],
+    );
+    let (mut first, _) = test.attach_with_token("search-a", FIRST_CLIENT_TOKEN);
+    let (mut second, _) = test.attach_with_token("search-b", SECOND_CLIENT_TOKEN);
+    first
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    write_message(
+        &mut first,
+        &ClientMessage::Search {
+            query: "missing-alpha".to_string(),
+            direction: 1,
+        },
+    )
+    .unwrap();
+    write_message(
+        &mut second,
+        &ClientMessage::Search {
+            query: "missing-beta".to_string(),
+            direction: 1,
+        },
+    )
+    .unwrap();
+
+    for stream in [&mut first, &mut second] {
+        loop {
+            if matches!(
+                next_server(stream),
+                ServerMessage::SearchResult { found: false }
+            ) {
+                break;
+            }
+        }
+    }
 }
 
 #[test]

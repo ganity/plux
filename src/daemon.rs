@@ -184,14 +184,14 @@ struct Daemon {
     events_rx: mpsc::Receiver<Event>,
     pane_events_tx: mpsc::SyncSender<PaneEvent>,
     pane_events_rx: mpsc::Receiver<PaneEvent>,
-    client: Option<Client>,
+    clients: HashMap<u64, Client>,
     next_client_id: u64,
     next_pane_id: u64,
     pending_resizes: HashMap<String, PendingResize>,
     pending_snapshots: HashSet<String>,
     pending_exits: Vec<PendingExit>,
     last_snapshot: Instant,
-    search_task: Option<SearchTask>,
+    search_tasks: HashMap<u64, SearchTask>,
     shutdown_requested: Arc<AtomicBool>,
 }
 
@@ -245,14 +245,14 @@ impl Daemon {
             events_rx,
             pane_events_tx,
             pane_events_rx,
-            client: None,
+            clients: HashMap::new(),
             next_client_id: 1,
             next_pane_id: 1,
             pending_resizes: HashMap::new(),
             pending_snapshots: HashSet::new(),
             pending_exits: Vec::new(),
             last_snapshot: Instant::now(),
-            search_task: None,
+            search_tasks: HashMap::new(),
             shutdown_requested,
         })
     }
@@ -265,9 +265,9 @@ impl Daemon {
 
     fn event_loop(&mut self) -> Result<()> {
         loop {
-            self.expire_stale_client();
+            self.expire_stale_clients();
             if self.shutdown_requested.load(Ordering::Acquire) {
-                self.wait_for_client_writer();
+                self.wait_for_client_writers();
                 self.shutdown_sessions();
                 return Ok(());
             }
@@ -289,14 +289,22 @@ impl Daemon {
                 };
                 self.handle_pane_event(event)?;
             }
-            self.process_search_step()?;
+            self.process_search_steps()?;
             self.flush_snapshots()?;
         }
     }
 
-    fn process_search_step(&mut self) -> Result<()> {
+    fn process_search_steps(&mut self) -> Result<()> {
+        let client_ids = self.search_tasks.keys().copied().collect::<Vec<_>>();
+        for client_id in client_ids {
+            self.process_search_step(client_id)?;
+        }
+        Ok(())
+    }
+
+    fn process_search_step(&mut self, client_id: u64) -> Result<()> {
         const SEARCH_STEP: usize = 64;
-        let Some(task) = self.search_task.as_ref() else {
+        let Some(task) = self.search_tasks.get(&client_id) else {
             return Ok(());
         };
         let session_name = task.session_name.clone();
@@ -305,10 +313,14 @@ impl Daemon {
         let mut missing = false;
 
         for _ in 0..SEARCH_STEP {
-            let Some(offset) = self.search_task.as_ref().and_then(SearchTask::offset) else {
+            let Some(offset) = self
+                .search_tasks
+                .get(&client_id)
+                .and_then(SearchTask::offset)
+            else {
                 break;
             };
-            if let Some(task) = self.search_task.as_mut() {
+            if let Some(task) = self.search_tasks.get_mut(&client_id) {
                 task.next = task.next.saturating_add(1);
             }
             let matches = self
@@ -335,14 +347,17 @@ impl Daemon {
         let finished = found
             || missing
             || self
-                .search_task
-                .as_ref()
+                .search_tasks
+                .get(&client_id)
                 .is_some_and(|task| task.offset().is_none());
         if !finished {
             return Ok(());
         }
 
-        let task = self.search_task.take().ok_or("search task disappeared")?;
+        let task = self
+            .search_tasks
+            .remove(&client_id)
+            .ok_or("search task disappeared")?;
         if !found {
             if let Some(session) = self.sessions.get_mut(&task.session_name) {
                 if let Some(pane) = session.panes.get_mut(&session.focused) {
@@ -350,12 +365,12 @@ impl Daemon {
                 }
             }
         }
-        self.send(ServerMessage::SearchResult { found })?;
-        self.send_attached_snapshot()
+        self.send_to(client_id, ServerMessage::SearchResult { found })?;
+        self.send_attached_snapshot(client_id)
     }
 
-    fn cancel_search(&mut self) -> Result<()> {
-        let Some(task) = self.search_task.take() else {
+    fn cancel_search(&mut self, client_id: u64) -> Result<()> {
+        let Some(task) = self.search_tasks.remove(&client_id) else {
             return Ok(());
         };
         if let Some(session) = self.sessions.get_mut(&task.session_name) {
@@ -383,17 +398,6 @@ impl Daemon {
                 self.pending_snapshots.insert(name);
             }
         }
-        if !self.pending_resizes.is_empty() {
-            return Ok(());
-        }
-        if self
-            .client
-            .as_ref()
-            .is_some_and(|client| client.snapshot_in_flight)
-        {
-            return Ok(());
-        }
-
         let interval =
             Duration::from_micros(1_000_000_u64 / u64::from(self.config.refresh_rate.max(1)));
         if self.pending_snapshots.is_empty() && self.pending_exits.is_empty()
@@ -401,24 +405,45 @@ impl Daemon {
         {
             return Ok(());
         }
+        let busy_clients = self
+            .clients
+            .values()
+            .filter(|client| client.snapshot_in_flight)
+            .map(|client| client.id)
+            .collect::<HashSet<_>>();
         let names = self.pending_snapshots.drain().collect::<Vec<_>>();
         for name in names {
-            self.send_snapshot(&name)?;
-        }
-        let exits = std::mem::take(&mut self.pending_exits);
-        for exit in exits {
-            if self
-                .sessions
-                .get(&exit.session_name)
-                .is_some_and(|session| session.attached)
-            {
-                self.send(ServerMessage::ProcessExited {
-                    pane_id: exit.pane_id,
-                    status: exit.status,
-                    session_finished: exit.session_finished,
-                })?;
+            let busy = self
+                .client_id_for_session(&name)
+                .is_some_and(|client_id| busy_clients.contains(&client_id));
+            if busy || self.pending_resizes.contains_key(&name) {
+                self.pending_snapshots.insert(name);
+            } else {
+                self.send_snapshot(&name)?;
             }
         }
+        let exits = std::mem::take(&mut self.pending_exits);
+        let mut deferred_exits = Vec::new();
+        for exit in exits {
+            if let Some(client_id) = self.client_id_for_session(&exit.session_name) {
+                if busy_clients.contains(&client_id)
+                    || self.pending_resizes.contains_key(&exit.session_name)
+                    || self.pending_snapshots.contains(&exit.session_name)
+                {
+                    deferred_exits.push(exit);
+                    continue;
+                }
+                self.send_to(
+                    client_id,
+                    ServerMessage::ProcessExited {
+                        pane_id: exit.pane_id,
+                        status: exit.status,
+                        session_finished: exit.session_finished,
+                    },
+                )?;
+            }
+        }
+        self.pending_exits.extend(deferred_exits);
         self.last_snapshot = Instant::now();
         Ok(())
     }
@@ -442,7 +467,6 @@ impl Daemon {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) => return Err(error.into()),
         };
-        let had_client = self.client.is_some();
         let mut stream = accepted;
         stream.set_nonblocking(false)?;
         if let Err(error) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
@@ -474,13 +498,17 @@ impl Daemon {
                     self.reject_client(stream, error.to_string());
                     return Ok(());
                 }
-                let same_client = self
-                    .client
-                    .as_ref()
+                let existing = self.client_id_for_session(&name);
+                let same_client = existing
+                    .and_then(|client_id| self.clients.get(&client_id))
                     .and_then(|client| client.token.as_deref())
                     == Some(client_token.as_str());
-                if !had_client || same_client || self.client_lease_expired() {
+                if existing.is_none()
+                    || same_client
+                    || existing.is_some_and(|client_id| self.client_lease_expired(client_id))
+                {
                     self.replace_client(
+                        existing,
                         stream,
                         ClientMessage::Attach {
                             name,
@@ -512,7 +540,9 @@ impl Daemon {
                     self.reject_client(stream, error.to_string());
                     return Ok(());
                 }
+                let existing = self.client_id_for_session(&name);
                 self.replace_client(
+                    existing,
                     stream,
                     ClientMessage::Takeover {
                         name,
@@ -529,19 +559,11 @@ impl Daemon {
             | Some(message @ ClientMessage::Shutdown) => {
                 self.handle_short_request(stream, message)?;
             }
-            _ if !had_client => {
-                let _ = write_message(
-                    &mut stream,
-                    &ServerMessage::Error {
-                        message: "expected Attach or Takeover as the first message".to_string(),
-                    },
-                );
-            }
             _ => {
                 let _ = write_message(
                     &mut stream,
                     &ServerMessage::Error {
-                        message: "another client is already attached".to_string(),
+                        message: "expected Attach or Takeover as the first message".to_string(),
                     },
                 );
             }
@@ -573,117 +595,96 @@ impl Daemon {
                 let last_seen = last_seen.clone();
                 move || client_reader(reader, events, client_id, last_seen)
             })?;
-        self.client = Some(Client {
-            id: client_id,
-            token,
-            last_seen,
-            writer,
-            session: None,
-            snapshot_in_flight: false,
-        });
+        self.clients.insert(
+            client_id,
+            Client {
+                id: client_id,
+                token,
+                last_seen,
+                writer,
+                session: None,
+                snapshot_in_flight: false,
+            },
+        );
         Ok(client_id)
     }
 
     fn replace_client(
         &mut self,
+        existing_client_id: Option<u64>,
         stream: UnixStream,
         message: ClientMessage,
         token: String,
     ) -> Result<()> {
-        self.detach_client();
-        self.install_client(stream, Some(token))?;
-        if let Err(error) = self.handle_client_message(message) {
-            let _ = self.send(ServerMessage::Error {
-                message: error.to_string(),
-            });
-            self.detach_client();
+        if let Some(client_id) = existing_client_id {
+            self.detach_client(client_id);
+        }
+        let client_id = self.install_client(stream, Some(token))?;
+        if let Err(error) = self.handle_client_message(client_id, message) {
+            let _ = self.send_to(
+                client_id,
+                ServerMessage::Error {
+                    message: error.to_string(),
+                },
+            );
+            self.detach_client(client_id);
         }
         Ok(())
     }
 
-    fn handle_short_request(
-        &mut self,
-        mut stream: UnixStream,
-        message: ClientMessage,
-    ) -> Result<()> {
-        if let ClientMessage::Kill { name } = &message {
-            if self.attached_session_name().as_deref() == Some(name) {
-                let _ = write_message(
-                    &mut stream,
-                    &ServerMessage::Error {
-                        message: "cannot kill the currently attached session from another client"
-                            .to_string(),
-                    },
-                );
-                return Ok(());
-            }
+    fn handle_short_request(&mut self, stream: UnixStream, message: ClientMessage) -> Result<()> {
+        let client_id = self.install_client(stream, None)?;
+        let writer = self
+            .clients
+            .get(&client_id)
+            .ok_or("short request client disappeared")?
+            .writer
+            .clone();
+        if let Err(error) = self.handle_client_message(client_id, message) {
+            let _ = self.send_to(
+                client_id,
+                ServerMessage::Error {
+                    message: error.to_string(),
+                },
+            );
         }
-
-        let active = self.client.take();
-        let writer = ClientWriter::new(stream, self.events_tx.clone(), u64::MAX)?;
-        let writer_handle = writer.clone();
-        self.client = Some(Client {
-            id: u64::MAX,
-            token: None,
-            last_seen: Arc::new(Mutex::new(Instant::now())),
-            writer,
-            session: None,
-            snapshot_in_flight: false,
-        });
-        if let Err(error) = self.handle_client_message(message) {
-            let _ = self.send(ServerMessage::Error {
-                message: error.to_string(),
-            });
-        }
-        writer_handle.wait_idle();
-        if self.client.is_some() {
-            self.detach_client();
-        }
-        self.client = active;
+        writer.wait_idle();
+        self.detach_client(client_id);
         Ok(())
     }
 
     fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::ClientMessage { client_id, message } => {
-                if self
-                    .client
-                    .as_ref()
-                    .is_none_or(|client| client.id != client_id)
-                {
+                if !self.clients.contains_key(&client_id) {
                     return Ok(());
                 }
-                if let Err(error) = self.handle_client_message(message) {
-                    let _ = self.send(ServerMessage::Error {
-                        message: error.to_string(),
-                    });
+                if let Err(error) = self.handle_client_message(client_id, message) {
+                    let _ = self.send_to(
+                        client_id,
+                        ServerMessage::Error {
+                            message: error.to_string(),
+                        },
+                    );
                 }
                 Ok(())
             }
             Event::ClientDisconnected(client_id) => {
-                if self
-                    .client
-                    .as_ref()
-                    .is_some_and(|client| client.id == client_id)
-                {
-                    self.detach_client();
+                if self.clients.contains_key(&client_id) {
+                    self.detach_client(client_id);
                     self.cleanup_finished_temporary();
                 }
                 Ok(())
             }
             Event::SnapshotWritten(client_id) => {
-                if let Some(client) = self.client.as_mut().filter(|client| client.id == client_id) {
+                if let Some(client) = self.clients.get_mut(&client_id) {
                     client.snapshot_in_flight = false;
                 }
                 Ok(())
             }
             Event::ClientWriteFailed(client_id) => {
-                if self
-                    .client
-                    .as_ref()
-                    .is_some_and(|client| client.id == client_id)
-                {
-                    self.detach_client();
+                if self.clients.contains_key(&client_id) {
+                    self.detach_client(client_id);
                     self.cleanup_finished_temporary();
                 }
                 Ok(())
@@ -691,10 +692,10 @@ impl Daemon {
         }
     }
 
-    fn handle_client_message(&mut self, message: ClientMessage) -> Result<()> {
+    fn handle_client_message(&mut self, client_id: u64, message: ClientMessage) -> Result<()> {
         let attached = self
-            .client
-            .as_ref()
+            .clients
+            .get(&client_id)
             .is_some_and(|client| client.session.is_some());
         let handshake_or_short_request = matches!(
             &message,
@@ -708,17 +709,20 @@ impl Daemon {
                 | ClientMessage::Ping
         );
         if !attached && !handshake_or_short_request {
-            let result = self.send(ServerMessage::Error {
-                message: "client must attach before sending interactive messages".to_string(),
-            });
-            self.detach_client();
+            let result = self.send_to(
+                client_id,
+                ServerMessage::Error {
+                    message: "client must attach before sending interactive messages".to_string(),
+                },
+            );
+            self.detach_client(client_id);
             return result;
         }
         if !matches!(
             &message,
             ClientMessage::Search { .. } | ClientMessage::Heartbeat
         ) {
-            self.cancel_search()?;
+            self.cancel_search(client_id)?;
         }
         match message {
             ClientMessage::Create {
@@ -729,8 +733,8 @@ impl Daemon {
                 temporary,
             } => {
                 self.create_session(name.clone(), rows, cols, command, temporary)?;
-                self.send(ServerMessage::Created { name })?;
-                self.detach_client();
+                self.send_to(client_id, ServerMessage::Created { name })?;
+                self.detach_client(client_id);
                 Ok(())
             }
             ClientMessage::Attach {
@@ -740,29 +744,35 @@ impl Daemon {
                 client_token,
             } => {
                 validate_client_token(&client_token)?;
-                if let Some(client) = self.client.as_mut() {
+                if let Some(client) = self.clients.get_mut(&client_id) {
                     if let Some(current_token) = client.token.as_ref() {
                         if current_token != &client_token {
-                            return self.send(ServerMessage::Error {
-                                message: "client token does not match the active connection"
-                                    .to_string(),
-                            });
+                            return self.send_to(
+                                client_id,
+                                ServerMessage::Error {
+                                    message: "client token does not match the active connection"
+                                        .to_string(),
+                                },
+                            );
                         }
                     } else {
                         client.token = Some(client_token);
                     }
                 }
                 if self
-                    .client
-                    .as_ref()
+                    .clients
+                    .get(&client_id)
                     .and_then(|client| client.session.as_ref())
                     .is_some()
                 {
-                    return self.send(ServerMessage::Error {
-                        message: "client is already attached".to_string(),
-                    });
+                    return self.send_to(
+                        client_id,
+                        ServerMessage::Error {
+                            message: "client is already attached".to_string(),
+                        },
+                    );
                 }
-                self.attach_session(name, rows, cols)
+                self.attach_session(client_id, name, rows, cols)
             }
             ClientMessage::Takeover {
                 name,
@@ -771,47 +781,56 @@ impl Daemon {
                 client_token,
             } => {
                 validate_client_token(&client_token)?;
-                if let Some(client) = self.client.as_mut() {
+                if let Some(client) = self.clients.get_mut(&client_id) {
                     client.token = Some(client_token);
                 }
-                self.attach_session(name, rows, cols)
+                self.attach_session(client_id, name, rows, cols)
             }
             ClientMessage::List => {
                 let mut names = self.sessions.keys().cloned().collect::<Vec<_>>();
                 names.sort();
-                self.send(ServerMessage::Sessions { names })?;
-                self.detach_client();
+                self.send_to(client_id, ServerMessage::Sessions { names })?;
+                self.detach_client(client_id);
                 Ok(())
             }
             ClientMessage::Kill { name } => {
                 validate_name(&name)?;
-                self.pending_resizes.remove(&name);
+                if self
+                    .client_id_for_session(&name)
+                    .is_some_and(|attached_id| attached_id != client_id)
+                {
+                    return self.send_to(
+                        client_id,
+                        ServerMessage::Error {
+                            message:
+                                "cannot kill the currently attached session from another client"
+                                    .to_string(),
+                        },
+                    );
+                }
+                self.clear_pending_session(&name);
                 if let Some(mut session) = self.sessions.remove(&name) {
                     for pane in session.panes.values_mut() {
                         let _ = pane.kill();
                     }
                 }
                 self.remove_metadata(&name)?;
-                if self
-                    .client
-                    .as_ref()
-                    .and_then(|client| client.session.as_ref())
-                    == Some(&name)
-                {
-                    self.send(ServerMessage::Detached)?;
-                    self.detach_client();
+                if self.attached_session_name(client_id).as_deref() == Some(&name) {
+                    self.send_to(client_id, ServerMessage::Detached)?;
+                    self.detach_client(client_id);
+                    return Ok(());
                 }
-                self.send(ServerMessage::Ok)?;
-                self.detach_client();
+                self.send_to(client_id, ServerMessage::Ok)?;
+                self.detach_client(client_id);
                 Ok(())
             }
             ClientMessage::Shutdown => {
-                self.send(ServerMessage::Ok)?;
+                self.send_to(client_id, ServerMessage::Ok)?;
                 self.shutdown_requested.store(true, Ordering::Release);
                 Ok(())
             }
             ClientMessage::Input { bytes } => {
-                if let Some(session) = self.attached_session_mut() {
+                if let Some(session) = self.attached_session_mut(client_id) {
                     if let Some(pane) = session.focused_pane_mut() {
                         pane.write_input_owned(bytes)?;
                     }
@@ -819,7 +838,7 @@ impl Daemon {
                 Ok(())
             }
             ClientMessage::Resize { rows, cols } => {
-                let session_name = self.attached_session_name();
+                let session_name = self.attached_session_name(client_id);
                 if let Some(name) = session_name {
                     self.pending_resizes.insert(
                         name,
@@ -833,43 +852,48 @@ impl Daemon {
                 Ok(())
             }
             ClientMessage::Scroll { rows } => {
-                self.with_focused_pane(|pane| {
+                self.with_focused_pane(client_id, |pane| {
                     pane.terminal.scroll(rows);
                     if !pane.terminal.is_scrolled() {
                         pane.clear_unread();
                     }
                 })?;
-                self.send_attached_snapshot()
+                self.send_attached_snapshot(client_id)
             }
             ClientMessage::ScrollToTop => {
-                self.with_focused_pane(|pane| pane.terminal.scroll_to_top())?;
-                self.send_attached_snapshot()
+                self.with_focused_pane(client_id, |pane| pane.terminal.scroll_to_top())?;
+                self.send_attached_snapshot(client_id)
             }
             ClientMessage::ScrollToBottom => {
-                self.with_focused_pane(|pane| {
+                self.with_focused_pane(client_id, |pane| {
                     pane.terminal.scroll_to_bottom();
                     pane.clear_unread();
                 })?;
-                self.send_attached_snapshot()
+                self.send_attached_snapshot(client_id)
             }
             ClientMessage::Search { query, direction } => {
-                self.cancel_search()?;
-                let session_name = self.attached_session_name().ok_or("no attached session")?;
-                let (original, maximum) = self.with_focused_pane(|pane| {
+                self.cancel_search(client_id)?;
+                let session_name = self
+                    .attached_session_name(client_id)
+                    .ok_or("no attached session")?;
+                let (original, maximum) = self.with_focused_pane(client_id, |pane| {
                     let original = pane.terminal.screen().scrollback();
                     pane.terminal.scroll_to_top();
                     let maximum = pane.terminal.screen().scrollback();
                     pane.terminal.set_scrollback(original);
                     (original, maximum)
                 })?;
-                self.search_task = Some(SearchTask {
-                    session_name,
-                    query,
-                    direction,
-                    original,
-                    maximum,
-                    next: 0,
-                });
+                self.search_tasks.insert(
+                    client_id,
+                    SearchTask {
+                        session_name,
+                        query,
+                        direction,
+                        original,
+                        maximum,
+                        next: 0,
+                    },
+                );
                 Ok(())
             }
             ClientMessage::Copy {
@@ -880,14 +904,14 @@ impl Daemon {
                 mode,
             } => {
                 let text = self
-                    .attached_session_mut()
+                    .attached_session_mut(client_id)
                     .and_then(|session| session.focused_pane_mut())
                     .map(|pane| {
                         pane.terminal
                             .selection_text(start_row, start_col, end_row, end_col, mode)
                     })
                     .unwrap_or_default();
-                self.send(ServerMessage::Copied { text })
+                self.send_to(client_id, ServerMessage::Copied { text })
             }
             ClientMessage::Split { vertical } => {
                 let direction = if vertical {
@@ -899,16 +923,16 @@ impl Daemon {
                 self.next_pane_id += 1;
                 let config = self.config.clone();
                 let events = self.pane_events_tx.clone();
-                if let Some(session) = self.attached_session_mut() {
+                if let Some(session) = self.attached_session_mut(client_id) {
                     session.split(new_pane_id, direction, &config, events)?;
                 }
-                if let Some(name) = self.attached_session_name() {
+                if let Some(name) = self.attached_session_name(client_id) {
                     self.persist_session(&name)?;
                 }
-                self.send_attached_snapshot()
+                self.send_attached_snapshot(client_id)
             }
             ClientMessage::ClosePane => {
-                let Some(name) = self.attached_session_name() else {
+                let Some(name) = self.attached_session_name(client_id) else {
                     return Ok(());
                 };
                 let close_session = self
@@ -916,15 +940,15 @@ impl Daemon {
                     .get(&name)
                     .is_some_and(|session| session.panes.len() == 1);
                 if close_session {
-                    self.pending_resizes.remove(&name);
+                    self.clear_pending_session(&name);
                     if let Some(mut session) = self.sessions.remove(&name) {
                         for pane in session.panes.values_mut() {
                             let _ = pane.kill();
                         }
                     }
                     self.remove_metadata(&name)?;
-                    self.send(ServerMessage::Detached)?;
-                    self.detach_client();
+                    self.send_to(client_id, ServerMessage::Detached)?;
+                    self.detach_client(client_id);
                     return Ok(());
                 }
                 if let Some(session) = self.sessions.get_mut(&name) {
@@ -935,9 +959,11 @@ impl Daemon {
             }
             ClientMessage::Rename { name } => {
                 validate_name(&name)?;
-                let old_name = self.attached_session_name().ok_or("no attached session")?;
+                let old_name = self
+                    .attached_session_name(client_id)
+                    .ok_or("no attached session")?;
                 if old_name == name {
-                    return self.send_attached_snapshot();
+                    return self.send_attached_snapshot(client_id);
                 }
                 if self.sessions.contains_key(&name) {
                     return Err(format!("session already exists: {name}").into());
@@ -948,22 +974,22 @@ impl Daemon {
                     .ok_or("session does not exist")?;
                 session.rename(name.clone());
                 self.sessions.insert(name.clone(), session);
-                if let Some(client) = self.client.as_mut() {
+                if let Some(client) = self.clients.get_mut(&client_id) {
                     client.session = Some(name.clone());
                 }
-                self.pending_resizes.remove(&old_name);
+                self.rename_pending_session(&old_name, &name);
                 self.remove_metadata(&old_name)?;
                 self.persist_session(&name)?;
-                self.send_attached_snapshot()
+                self.send_attached_snapshot(client_id)
             }
             ClientMessage::AdjustRatio { delta } => {
-                if let Some(session) = self.attached_session_mut() {
+                if let Some(session) = self.attached_session_mut(client_id) {
                     session.adjust_ratio(delta)?;
                 }
-                if let Some(name) = self.attached_session_name() {
+                if let Some(name) = self.attached_session_name(client_id) {
                     self.persist_session(&name)?;
                 }
-                self.send_attached_snapshot()
+                self.send_attached_snapshot(client_id)
             }
             ClientMessage::Focus { direction } => {
                 let direction = match direction.as_str() {
@@ -972,38 +998,41 @@ impl Daemon {
                     "up" => FocusDirection::Up,
                     "down" => FocusDirection::Down,
                     _ => {
-                        return self.send(ServerMessage::Error {
-                            message: format!("unknown focus direction: {direction}"),
-                        })
+                        return self.send_to(
+                            client_id,
+                            ServerMessage::Error {
+                                message: format!("unknown focus direction: {direction}"),
+                            },
+                        )
                     }
                 };
-                if let Some(session) = self.attached_session_mut() {
+                if let Some(session) = self.attached_session_mut(client_id) {
                     session.focus(direction);
                 }
-                self.send_attached_snapshot()
+                self.send_attached_snapshot(client_id)
             }
             ClientMessage::Zoom => {
-                if let Some(session) = self.attached_session_mut() {
+                if let Some(session) = self.attached_session_mut(client_id) {
                     session.toggle_zoom();
                 }
-                self.send_attached_snapshot()
+                self.send_attached_snapshot(client_id)
             }
             ClientMessage::Detach => {
-                self.send(ServerMessage::Detached)?;
-                self.detach_client();
+                self.send_to(client_id, ServerMessage::Detached)?;
+                self.detach_client(client_id);
                 self.cleanup_finished_temporary();
                 Ok(())
             }
             ClientMessage::Ping => {
-                self.send(ServerMessage::Pong)?;
-                self.detach_client();
+                self.send_to(client_id, ServerMessage::Pong)?;
+                self.detach_client(client_id);
                 Ok(())
             }
-            ClientMessage::Heartbeat => self.send(ServerMessage::HeartbeatAck),
+            ClientMessage::Heartbeat => self.send_to(client_id, ServerMessage::HeartbeatAck),
         }
     }
 
-    fn attach_session(&mut self, name: String, rows: u16, cols: u16) -> Result<()> {
+    fn attach_session(&mut self, client_id: u64, name: String, rows: u16, cols: u16) -> Result<()> {
         self.validate_attach_target(&name)?;
         let (pane_id, restarted) = {
             let session = self.sessions.get_mut(&name).expect("session exists");
@@ -1021,22 +1050,31 @@ impl Daemon {
             .get(&name)
             .and_then(|session| session.exited.get(&pane_id))
             .cloned();
-        if let Some(client) = self.client.as_mut() {
+        if let Some(client) = self.clients.get_mut(&client_id) {
             client.session = Some(name.clone());
         }
-        self.send(ServerMessage::Attached {
-            name: name.clone(),
-            pane_id,
-        })?;
+        self.send_to(
+            client_id,
+            ServerMessage::Attached {
+                name: name.clone(),
+                pane_id,
+            },
+        )?;
         self.persist_session(&name)?;
         self.send_snapshot(&name)?;
         if !restarted {
             if let Some(status) = exited {
-                self.send(ServerMessage::ProcessExited {
-                    pane_id,
-                    status,
-                    session_finished: self.sessions.get(&name).is_some_and(Session::is_finished),
-                })?;
+                self.send_to(
+                    client_id,
+                    ServerMessage::ProcessExited {
+                        pane_id,
+                        status,
+                        session_finished: self
+                            .sessions
+                            .get(&name)
+                            .is_some_and(Session::is_finished),
+                    },
+                )?;
             }
         }
         Ok(())
@@ -1104,7 +1142,9 @@ impl Daemon {
                     .get(&session_name)
                     .is_some_and(|session| session.attached);
                 if attached {
-                    self.send(ServerMessage::Error { message: error })?;
+                    if let Some(client_id) = self.client_id_for_session(&session_name) {
+                        self.send_to(client_id, ServerMessage::Error { message: error })?;
+                    }
                 }
             }
         }
@@ -1158,32 +1198,60 @@ impl Daemon {
         }
     }
 
-    fn attached_session_name(&self) -> Option<String> {
-        self.client.as_ref()?.session.clone()
+    fn clear_pending_session(&mut self, name: &str) {
+        self.pending_resizes.remove(name);
+        self.pending_snapshots.remove(name);
+        self.pending_exits.retain(|exit| exit.session_name != name);
     }
 
-    fn attached_session_mut(&mut self) -> Option<&mut Session> {
-        let name = self.attached_session_name()?;
+    fn rename_pending_session(&mut self, old_name: &str, new_name: &str) {
+        if let Some(resize) = self.pending_resizes.remove(old_name) {
+            self.pending_resizes.insert(new_name.to_string(), resize);
+        }
+        if self.pending_snapshots.remove(old_name) {
+            self.pending_snapshots.insert(new_name.to_string());
+        }
+        for exit in &mut self.pending_exits {
+            if exit.session_name == old_name {
+                exit.session_name = new_name.to_string();
+            }
+        }
+    }
+
+    fn client_id_for_session(&self, name: &str) -> Option<u64> {
+        self.clients
+            .values()
+            .find(|client| client.session.as_deref() == Some(name))
+            .map(|client| client.id)
+    }
+
+    fn attached_session_name(&self, client_id: u64) -> Option<String> {
+        self.clients.get(&client_id)?.session.clone()
+    }
+
+    fn attached_session_mut(&mut self, client_id: u64) -> Option<&mut Session> {
+        let name = self.attached_session_name(client_id)?;
         self.sessions.get_mut(&name)
     }
 
     fn with_focused_pane<T>(
         &mut self,
+        client_id: u64,
         operation: impl FnOnce(&mut crate::pane::Pane) -> T,
     ) -> Result<T> {
-        self.attached_session_mut()
+        self.attached_session_mut(client_id)
             .and_then(|session| session.focused_pane_mut())
             .map(operation)
             .ok_or_else(|| "no attached pane".into())
     }
 
-    fn send_attached_snapshot(&mut self) -> Result<()> {
-        let Some(name) = self.attached_session_name() else {
+    fn send_attached_snapshot(&mut self, client_id: u64) -> Result<()> {
+        let Some(name) = self.attached_session_name(client_id) else {
             return Ok(());
         };
         if self
-            .client
-            .as_ref()
+            .clients
+            .get(&client_id)
             .is_some_and(|client| client.snapshot_in_flight)
         {
             self.pending_snapshots.insert(name);
@@ -1193,11 +1261,16 @@ impl Daemon {
     }
 
     fn send_snapshot(&mut self, session_name: &str) -> Result<()> {
+        let Some(client_id) = self.client_id_for_session(session_name) else {
+            self.pending_snapshots.remove(session_name);
+            return Ok(());
+        };
         if self
-            .client
-            .as_ref()
+            .clients
+            .get(&client_id)
             .is_some_and(|client| client.snapshot_in_flight)
         {
+            self.pending_snapshots.insert(session_name.to_string());
             return Ok(());
         }
         self.pending_snapshots.remove(session_name);
@@ -1209,24 +1282,27 @@ impl Daemon {
         let mouse_enabled = session.focused_mouse_enabled();
         let alternate_screen = session.focused_alternate_screen();
         let scrollback_available = session.focused_scrollback_available();
-        let result = self.send(ServerMessage::Snapshot {
-            rows,
-            cols,
-            data,
-            mouse_enabled,
-            alternate_screen,
-            scrollback_available,
-        });
+        let result = self.send_to(
+            client_id,
+            ServerMessage::Snapshot {
+                rows,
+                cols,
+                data,
+                mouse_enabled,
+                alternate_screen,
+                scrollback_available,
+            },
+        );
         self.last_snapshot = Instant::now();
         result
     }
 
-    fn send(&mut self, message: ServerMessage) -> Result<()> {
+    fn send_to(&mut self, client_id: u64, message: ServerMessage) -> Result<()> {
         let is_snapshot = matches!(message, ServerMessage::Snapshot { .. });
-        let Some((client_id, writer, snapshot_in_flight)) = self
-            .client
-            .as_ref()
-            .map(|client| (client.id, client.writer.clone(), client.snapshot_in_flight))
+        let Some((writer, snapshot_in_flight)) = self
+            .clients
+            .get(&client_id)
+            .map(|client| (client.writer.clone(), client.snapshot_in_flight))
         else {
             return Ok(());
         };
@@ -1234,19 +1310,19 @@ impl Daemon {
             return Ok(());
         }
         if writer.enqueue(message, is_snapshot).is_err() {
-            self.detach_client();
+            self.detach_client(client_id);
             return Ok(());
         }
         if is_snapshot {
-            if let Some(client) = self.client.as_mut().filter(|client| client.id == client_id) {
+            if let Some(client) = self.clients.get_mut(&client_id) {
                 client.snapshot_in_flight = true;
             }
         }
         Ok(())
     }
 
-    fn client_lease_expired(&self) -> bool {
-        self.client.as_ref().is_some_and(|client| {
+    fn client_lease_expired(&self, client_id: u64) -> bool {
+        self.clients.get(&client_id).is_some_and(|client| {
             client.token.is_some()
                 && client.last_seen.lock().map_or(true, |last_seen| {
                     last_seen.elapsed() >= CLIENT_LEASE_TIMEOUT
@@ -1254,29 +1330,35 @@ impl Daemon {
         })
     }
 
-    fn expire_stale_client(&mut self) {
-        if self.client_lease_expired() {
-            self.detach_client();
+    fn expire_stale_clients(&mut self) {
+        let expired = self
+            .clients
+            .keys()
+            .copied()
+            .filter(|client_id| self.client_lease_expired(*client_id))
+            .collect::<Vec<_>>();
+        for client_id in expired {
+            self.detach_client(client_id);
             self.cleanup_finished_temporary();
         }
     }
 
-    fn detach_client(&mut self) {
-        let _ = self.cancel_search();
-        let Some(client) = self.client.take() else {
+    fn detach_client(&mut self, client_id: u64) {
+        let _ = self.cancel_search(client_id);
+        let Some(client) = self.clients.remove(&client_id) else {
             return;
         };
         client.writer.close();
         if let Some(name) = client.session {
-            self.pending_resizes.remove(&name);
+            self.clear_pending_session(&name);
             if let Some(session) = self.sessions.get_mut(&name) {
                 session.attached = false;
             }
         }
     }
 
-    fn wait_for_client_writer(&self) {
-        if let Some(client) = self.client.as_ref() {
+    fn wait_for_client_writers(&self) {
+        for client in self.clients.values() {
             client.writer.wait_idle();
         }
     }
@@ -1289,7 +1371,7 @@ impl Daemon {
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         for name in names {
-            self.pending_resizes.remove(&name);
+            self.clear_pending_session(&name);
             if let Some(mut session) = self.sessions.remove(&name) {
                 for pane in session.panes.values_mut() {
                     let _ = pane.kill();
