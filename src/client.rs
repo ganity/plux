@@ -1211,10 +1211,20 @@ impl InputState {
         let row = row.min(self.rows.saturating_sub(1));
         let col = col.min(self.cols.saturating_sub(1));
         if self.mouse_selecting {
+            let moved = (row, col) != (self.cursor_row, self.cursor_col);
+            if self.selection_anchor.is_none() && (code & 32 != 0 || release && moved) {
+                let anchor = (self.cursor_row, self.cursor_col);
+                self.enter_scroll_mode();
+                self.selection_anchor = Some(anchor);
+                self.selection_mode = CopyMode::Character;
+            }
             self.cursor_row = row;
             self.cursor_col = col;
             if release {
                 self.mouse_selecting = false;
+                if self.selection_anchor.is_none() {
+                    return true;
+                }
                 let (start_row, start_col, end_row, end_col) = self.selection_coordinates();
                 actions.push(InputAction::Message(ClientMessage::Copy {
                     start_row,
@@ -1227,11 +1237,10 @@ impl InputState {
             return true;
         }
         if !release && code & 3 == 0 && code & 32 == 0 {
-            if self.mode != InputMode::Scroll {
-                self.enter_scroll_mode();
+            if self.mode == InputMode::Scroll {
+                self.selection_anchor = Some((row, col));
+                self.selection_mode = CopyMode::Character;
             }
-            self.selection_anchor = Some((row, col));
-            self.selection_mode = CopyMode::Character;
             self.cursor_row = row;
             self.cursor_col = col;
             self.mouse_selecting = true;
@@ -1246,6 +1255,13 @@ impl InputState {
         self.selection_mode = CopyMode::Character;
         self.cursor_row = self.rows.saturating_sub(1);
         self.cursor_col = 0;
+    }
+
+    fn exit_scroll_mode(&mut self) {
+        self.mode = InputMode::Normal;
+        self.selection_anchor = None;
+        self.selection_mode = CopyMode::Character;
+        self.mouse_selecting = false;
     }
 
     fn feed_byte(&mut self, byte: u8, actions: &mut Vec<InputAction>) {
@@ -1398,10 +1414,7 @@ impl InputState {
                 self.query.clear();
             }
             b'q' => {
-                self.mode = InputMode::Normal;
-                self.selection_anchor = None;
-                self.selection_mode = CopyMode::Character;
-                self.mouse_selecting = false;
+                self.exit_scroll_mode();
                 actions.push(InputAction::Message(ClientMessage::ScrollToBottom));
             }
             _ => {}
@@ -1464,7 +1477,7 @@ impl InputState {
             let pending = std::mem::take(&mut self.pending_escape);
             self.escape_started = None;
             if self.mode == InputMode::Scroll {
-                self.mode = InputMode::Normal;
+                self.exit_scroll_mode();
                 return Some(InputAction::Message(ClientMessage::ScrollToBottom));
             }
             if !pending.is_empty() {
@@ -1989,10 +2002,12 @@ mod tests {
     fn mouse_drag_creates_a_copy_selection() {
         let mut state = InputState::new(24, 80, 0);
         assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
-        assert!(matches!(state.mode, super::InputMode::Scroll));
-        assert_eq!(state.selection_anchor, Some((1, 2)));
+        assert!(matches!(state.mode, super::InputMode::Normal));
+        assert!(state.selection_anchor.is_none());
 
         assert!(state.feed(b"\x1b[<32;6;2M").is_empty());
+        assert!(matches!(state.mode, super::InputMode::Scroll));
+        assert_eq!(state.selection_anchor, Some((1, 2)));
         assert_eq!(state.selection_coordinates_if_active(), Some((1, 2, 1, 6)));
         let actions = state.feed(b"\x1b[<0;6;2m");
         assert!(matches!(
@@ -2005,6 +2020,41 @@ mod tests {
                 mode: crate::protocol::CopyMode::Character,
             })]
         ));
+    }
+
+    #[test]
+    fn mouse_click_does_not_enter_selection() {
+        let mut state = InputState::new(24, 80, 0);
+
+        assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
+        assert!(state.feed(b"\x1b[<0;3;2m").is_empty());
+        assert!(matches!(state.mode, super::InputMode::Normal));
+        assert!(state.selection_anchor.is_none());
+        assert!(!state.mouse_selecting);
+    }
+
+    #[test]
+    fn escape_clears_mouse_selection_before_the_next_drag() {
+        let mut state = InputState::new(24, 80, 0);
+        assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
+        assert!(state.feed(b"\x1b[<32;6;2M").is_empty());
+        assert!(matches!(state.mode, super::InputMode::Scroll));
+
+        assert!(state.feed(b"\x1b").is_empty());
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(matches!(
+            state.tick(),
+            Some(InputAction::Message(ClientMessage::ScrollToBottom))
+        ));
+        assert!(matches!(state.mode, super::InputMode::Normal));
+        assert!(state.selection_anchor.is_none());
+        assert!(!state.mouse_selecting);
+        assert!(state.selection_coordinates_if_active().is_none());
+
+        assert!(state.feed(b"\x1b[<0;4;3M").is_empty());
+        assert!(state.feed(b"\x1b[<32;8;3M").is_empty());
+        assert!(matches!(state.mode, super::InputMode::Scroll));
+        assert_eq!(state.selection_anchor, Some((2, 3)));
     }
 
     #[test]
