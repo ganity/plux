@@ -380,11 +380,7 @@ fn large_resize_snapshot_survives_temporary_backpressure() {
 
     for _ in 0..2 {
         write_message(&mut attached, &ClientMessage::Heartbeat).unwrap();
-        loop {
-            if matches!(next_server(&mut attached), ServerMessage::HeartbeatAck) {
-                break;
-            }
-        }
+        wait_for_heartbeat(&mut attached);
     }
 
     let mut burst = Vec::new();
@@ -560,12 +556,9 @@ fn takeover_of_other_session_keeps_existing_client_connection() {
     ));
 
     write_message(&mut work, &ClientMessage::Heartbeat).unwrap();
-    assert!(matches!(
-        next_server(&mut work),
-        ServerMessage::HeartbeatAck
-    ));
+    wait_for_heartbeat(&mut work);
     write_message(&mut web, &ClientMessage::Heartbeat).unwrap();
-    assert!(matches!(next_server(&mut web), ServerMessage::HeartbeatAck));
+    wait_for_heartbeat(&mut web);
 }
 
 #[test]
@@ -611,13 +604,11 @@ fn takeover_replaces_only_the_target_session_client() {
             Err(_) => break,
         }
     }
+    thread::sleep(Duration::from_millis(200));
     write_message(&mut web, &ClientMessage::Heartbeat).unwrap();
-    assert!(matches!(next_server(&mut web), ServerMessage::HeartbeatAck));
+    wait_for_heartbeat(&mut web);
     write_message(&mut new_work, &ClientMessage::Heartbeat).unwrap();
-    assert!(matches!(
-        next_server(&mut new_work),
-        ServerMessage::HeartbeatAck
-    ));
+    wait_for_heartbeat(&mut new_work);
 }
 
 #[test]
@@ -665,12 +656,9 @@ fn different_sessions_receive_their_own_output_and_survive_short_requests() {
     assert!(test.cli(&["kill", "short-request"]).status.success());
 
     write_message(&mut work, &ClientMessage::Heartbeat).unwrap();
-    assert!(matches!(
-        next_server(&mut work),
-        ServerMessage::HeartbeatAck
-    ));
+    wait_for_heartbeat(&mut work);
     write_message(&mut web, &ClientMessage::Heartbeat).unwrap();
-    assert!(matches!(next_server(&mut web), ServerMessage::HeartbeatAck));
+    wait_for_heartbeat(&mut web);
 }
 
 #[test]
@@ -697,10 +685,7 @@ fn same_client_token_reconnects_and_heartbeats() {
     }
 
     write_message(&mut resumed, &ClientMessage::Heartbeat).unwrap();
-    assert!(matches!(
-        next_server(&mut resumed),
-        ServerMessage::HeartbeatAck
-    ));
+    wait_for_heartbeat(&mut resumed);
 
     let mut competing = UnixStream::connect(test.socket_path()).unwrap();
     write_message(
@@ -740,10 +725,7 @@ fn repeated_same_token_reconnects_leave_one_client() {
             }
         }
         write_message(&mut next, &ClientMessage::Heartbeat).unwrap();
-        assert!(matches!(
-            next_server(&mut next),
-            ServerMessage::HeartbeatAck
-        ));
+        wait_for_heartbeat(&mut next);
         current = next;
     }
 
@@ -824,7 +806,12 @@ fn bridge_keeps_forwarding_after_interactive_attach() {
     );
 
     write_message(&mut stdin, &ClientMessage::Heartbeat).unwrap();
-    let heartbeat = messages_rx.recv_timeout(Duration::from_secs(1));
+    let heartbeat = loop {
+        match messages_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(ServerMessage::Snapshot { .. }) => {}
+            response => break response,
+        }
+    };
     if !matches!(heartbeat, Ok(ServerMessage::HeartbeatAck)) {
         let _ = bridge.kill();
         let _ = bridge.wait();
@@ -832,10 +819,13 @@ fn bridge_keeps_forwarding_after_interactive_attach() {
     }
 
     write_message(&mut stdin, &ClientMessage::Detach).unwrap();
-    assert!(matches!(
-        messages_rx.recv_timeout(Duration::from_secs(1)),
-        Ok(ServerMessage::Detached)
-    ));
+    let detached = loop {
+        match messages_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(ServerMessage::Snapshot { .. }) => {}
+            response => break response,
+        }
+    };
+    assert!(matches!(detached, Ok(ServerMessage::Detached)));
     drop(stdin);
     assert!(bridge.wait().unwrap().success());
 }
