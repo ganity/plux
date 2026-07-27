@@ -145,6 +145,9 @@ impl ClientHarness {
                 pixel_height: 0,
             })
             .unwrap();
+    }
+
+    fn signal_client(&self) {
         let pid = self.child.process_id().unwrap().to_string();
         assert!(
             Command::new("kill")
@@ -189,6 +192,29 @@ impl ClientHarness {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("session {session:?} did not reach {expected} panes");
+    }
+
+    fn wait_for_shell_size(&mut self, rows: u16, cols: u16, timeout: Duration) -> String {
+        let expected = format!("{rows} {cols}");
+        let deadline = Instant::now() + timeout;
+        let mut attempt = 0_u32;
+        let mut last_output = String::new();
+        while Instant::now() < deadline {
+            self.signal_client();
+            let marker = format!("PLUX_SIZE_PROBE_{attempt}");
+            let command = format!("stty size; printf '{marker}\\n'\r");
+            self.writer.write_all(command.as_bytes()).unwrap();
+            self.writer.flush().unwrap();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let output = self.wait_for_output(&marker, remaining);
+            if output.contains(&expected) {
+                return output;
+            }
+            last_output = output;
+            attempt += 1;
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("shell did not observe PTY size {expected}: {last_output}");
     }
 
     fn detach(&mut self) {
@@ -255,12 +281,7 @@ fn real_client_survives_one_resize() {
     test.resize(48, 160);
     thread::sleep(Duration::from_millis(200));
     test.resume_output();
-    thread::sleep(Duration::from_millis(500));
-    test.writer
-        .write_all(b"stty size; printf 'PLUX_RESIZE_AFTER\\n'\r")
-        .unwrap();
-    test.writer.flush().unwrap();
-    let output = test.wait_for_output("PLUX_RESIZE_AFTER", Duration::from_secs(10));
+    let output = test.wait_for_shell_size(48, 160, Duration::from_secs(10));
     assert!(test.client_is_running());
     assert!(
         output.contains("48 160"),
@@ -292,12 +313,7 @@ fn real_client_coalesces_large_resize_drag() {
         test.resize(rows, cols);
     }
     test.resize(36, 140);
-    thread::sleep(Duration::from_millis(700));
-    test.writer
-        .write_all(b"stty size; printf 'PLUX_LARGE_RESIZE_AFTER\\n'\r")
-        .unwrap();
-    test.writer.flush().unwrap();
-    let output = test.wait_for_output("PLUX_LARGE_RESIZE_AFTER", Duration::from_secs(10));
+    let output = test.wait_for_shell_size(36, 140, Duration::from_secs(10));
     assert!(
         output.contains("36 140"),
         "final PTY size was not rendered: {output}"
