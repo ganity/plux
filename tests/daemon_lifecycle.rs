@@ -158,13 +158,26 @@ fn next_server<R: Read>(stream: &mut R) -> ServerMessage {
     read_message(stream).unwrap().unwrap()
 }
 
-fn wait_for_detached(stream: &mut UnixStream) {
+fn wait_for_detached<R: Read>(stream: &mut R) {
     for _ in 0..20 {
-        if matches!(next_server(stream), ServerMessage::Detached) {
-            return;
+        match next_server(stream) {
+            ServerMessage::Detached => return,
+            ServerMessage::Snapshot { .. } => {}
+            response => panic!("unexpected detach response: {response:?}"),
         }
     }
     panic!("client did not receive Detached");
+}
+
+fn wait_for_heartbeat<R: Read>(stream: &mut R) {
+    for _ in 0..20 {
+        match next_server(stream) {
+            ServerMessage::HeartbeatAck => return,
+            ServerMessage::Snapshot { .. } => {}
+            response => panic!("unexpected heartbeat response: {response:?}"),
+        }
+    }
+    panic!("client did not receive HeartbeatAck");
 }
 
 #[test]
@@ -889,24 +902,16 @@ fn bridges_can_attach_different_sessions_concurrently() {
         ServerMessage::Snapshot { .. }
     ));
 
+    thread::sleep(Duration::from_millis(200));
     write_message(&mut work_in, &ClientMessage::Heartbeat).unwrap();
-    assert!(matches!(
-        next_server(&mut work_out),
-        ServerMessage::HeartbeatAck
-    ));
+    wait_for_heartbeat(&mut work_out);
     write_message(&mut web_in, &ClientMessage::Heartbeat).unwrap();
-    assert!(matches!(
-        next_server(&mut web_out),
-        ServerMessage::HeartbeatAck
-    ));
+    wait_for_heartbeat(&mut web_out);
 
     write_message(&mut work_in, &ClientMessage::Detach).unwrap();
-    assert!(matches!(
-        next_server(&mut work_out),
-        ServerMessage::Detached
-    ));
+    wait_for_detached(&mut work_out);
     write_message(&mut web_in, &ClientMessage::Detach).unwrap();
-    assert!(matches!(next_server(&mut web_out), ServerMessage::Detached));
+    wait_for_detached(&mut web_out);
     drop(work_in);
     drop(web_in);
     assert!(work_bridge.wait().unwrap().success());
