@@ -1074,6 +1074,12 @@ impl InputState {
 
         let mut index = 0;
         while index < input.len() {
+            if self.mode == InputMode::Scroll && input[index..].starts_with(b"\x1b\x1b") {
+                self.exit_scroll_mode();
+                actions.push(InputAction::Message(ClientMessage::ScrollToBottom));
+                index += 1;
+                continue;
+            }
             if input[index..].starts_with(b"\x1b[M") {
                 if input.len() - index < 6 {
                     self.defer_escape(&input[index..]);
@@ -1695,6 +1701,70 @@ mod tests {
         assert!(matches!(
             actions.as_slice(),
             [InputAction::Forward(bytes)] if bytes == paste
+        ));
+    }
+
+    #[test]
+    fn bracketed_paste_immediately_after_escape_exits_selection_and_is_forwarded() {
+        let mut state = InputState::new(24, 80, 0);
+        state.enter_scroll_mode();
+        state.toggle_selection(crate::protocol::CopyMode::Character);
+        assert!(state.feed(b"\x1b").is_empty());
+
+        let paste = b"\x1b[200~hello from paste\x1b[201~";
+        let actions = state.feed(paste);
+
+        assert!(matches!(state.mode, super::InputMode::Normal));
+        assert!(state.selection_anchor.is_none());
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                InputAction::Message(ClientMessage::ScrollToBottom),
+                InputAction::Forward(bytes)
+            ] if bytes == paste
+        ));
+    }
+
+    #[test]
+    fn bracketed_paste_in_the_same_input_as_escape_exits_selection() {
+        let mut state = InputState::new(24, 80, 0);
+        state.enter_scroll_mode();
+        state.toggle_selection(crate::protocol::CopyMode::Character);
+
+        let paste = b"\x1b[200~hello from paste\x1b[201~";
+        let mut input = Vec::from(b"\x1b".as_slice());
+        input.extend_from_slice(paste);
+        let actions = state.feed(&input);
+
+        assert!(matches!(state.mode, super::InputMode::Normal));
+        assert!(state.selection_anchor.is_none());
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                InputAction::Message(ClientMessage::ScrollToBottom),
+                InputAction::Forward(bytes)
+            ] if bytes == paste
+        ));
+    }
+
+    #[test]
+    fn split_bracketed_paste_after_escape_is_forwarded() {
+        let mut state = InputState::new(24, 80, 0);
+        state.enter_scroll_mode();
+        assert!(state.feed(b"\x1b").is_empty());
+
+        let exit = state.feed(b"\x1b");
+        assert!(matches!(
+            exit.as_slice(),
+            [InputAction::Message(ClientMessage::ScrollToBottom)]
+        ));
+        let paste = state.feed(b"[200~hello from paste\x1b[201~");
+
+        assert!(matches!(state.mode, super::InputMode::Normal));
+        assert!(matches!(
+            paste.as_slice(),
+            [InputAction::Forward(bytes)]
+                if bytes == b"\x1b[200~hello from paste\x1b[201~"
         ));
     }
 
