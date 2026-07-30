@@ -16,6 +16,7 @@ pub struct Config {
     pub mouse: bool,
     pub refresh_rate: u16,
     pub copy_command: Option<String>,
+    pub clipboard_upload_max_bytes: usize,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -27,6 +28,7 @@ struct FileConfig {
     mouse: Option<bool>,
     refresh_rate: Option<u16>,
     copy_command: Option<String>,
+    clipboard_upload_max_bytes: Option<String>,
 }
 
 impl Default for Config {
@@ -39,6 +41,7 @@ impl Default for Config {
             mouse: true,
             refresh_rate: 60,
             copy_command: None,
+            clipboard_upload_max_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -74,6 +77,9 @@ impl Config {
             config.refresh_rate = value.clamp(1, 240);
         }
         config.copy_command = file.copy_command;
+        if let Some(value) = file.clipboard_upload_max_bytes {
+            config.clipboard_upload_max_bytes = parse_size(&value)?;
+        }
         Ok(config)
     }
 

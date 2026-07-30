@@ -1,5 +1,6 @@
 mod cli;
 mod client;
+mod clipboard;
 mod config;
 mod daemon;
 mod error;
@@ -64,6 +65,7 @@ fn main() -> Result<()> {
         Command::Run { command } => client::run(&config, command)?,
         Command::Daemon => daemon::run(config)?,
         Command::Bridge { start } => transport::bridge(&config, start)?,
+        Command::Upload => transport::receive_upload(&config)?,
         Command::Help => unreachable!(),
     }
     Ok(())

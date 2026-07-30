@@ -24,6 +24,8 @@ selection.
 
 Use the terminal's normal keyboard paste shortcut. When mouse capture is active,
 use Shift with the terminal's right-click paste action to bypass mouse reporting.
+In an SSH session, an image or file paste shows progress in the status line;
+press `Esc` to cancel it. Text pastes remain unchanged.
 
 | Keys | Action |
 |---|---|

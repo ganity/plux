@@ -23,6 +23,7 @@ pub enum Command {
     Bridge {
         start: bool,
     },
+    Upload,
     Help,
 }
 
@@ -56,6 +57,12 @@ fn parse_args(args: Vec<String>) -> Result<Command> {
                 }
             };
             Ok(Command::Bridge { start })
+        }
+        "__upload" => {
+            if rest.next().is_some() {
+                return Err("unexpected __upload argument".into());
+            }
+            Ok(Command::Upload)
         }
         "new" => Ok(Command::New {
             name: rest.next().unwrap_or_else(|| "default".to_string()),
@@ -161,5 +168,10 @@ mod tests {
                 command: args.to_vec()
             }
         );
+    }
+
+    #[test]
+    fn hidden_upload_accepts_no_shell_arguments() {
+        assert_eq!(parse(&["__upload"]), Command::Upload);
     }
 }

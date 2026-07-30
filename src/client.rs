@@ -21,11 +21,12 @@ use signal_hook::{
 };
 
 use crate::{
+    clipboard::ClipboardPayload,
     config::Config,
     error::Result,
     protocol::{read_message, write_message, ClientMessage, CopyMode, ServerMessage},
     socket::{connect, connect_or_start},
-    transport::Connection,
+    transport::{Connection, SshUploader, UploadControl, UploadItem},
 };
 
 const MOUSE_SCROLL_LINES: i32 = 3;
@@ -34,6 +35,10 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const CLIENT_INPUT_CAPACITY: usize = 256;
 const CLIENT_SERVER_CAPACITY: usize = 8;
 const MAX_CONSECUTIVE_INPUT_EVENTS: usize = 8;
+const MAX_DETECTED_PASTE_BYTES: usize = 64 * 1024;
+const PASTE_PREFIX_TIMEOUT: Duration = Duration::from_millis(5);
+const PASTE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
+const CLIPBOARD_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 type ClientWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 pub fn request(config: &Config, message: ClientMessage) -> Result<ServerMessage> {
@@ -61,7 +66,7 @@ fn attach_stream(
     ssh_target: Option<&str>,
 ) -> Result<Connection> {
     let mut connection = match ssh_target {
-        Some(target) => Connection::ssh(target, false)?,
+        Some(target) => Connection::ssh(config, target, false)?,
         None => Connection::local(config)
             .map_err(|error| format!("plux daemon is not running or unavailable: {error}"))?,
     };
@@ -122,7 +127,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
     let prefix_byte = config.prefix_byte()?;
     let (mut cols, mut rows) = terminal_size()?;
     match ssh_target {
-        Some(target) => create_session_if_missing_ssh(target, &session_name, rows, cols)?,
+        Some(target) => create_session_if_missing_ssh(config, target, &session_name, rows, cols)?,
         None => create_session_if_missing(config, &session_name, rows, cols)?,
     }
     let client_token = generate_client_token()?;
@@ -136,6 +141,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
         ssh_target,
     )?;
     let mut writer = connection.writer.clone();
+    let mut uploader = connection.uploader();
     let (input_events_tx, input_events_rx) = mpsc::sync_channel(CLIENT_INPUT_CAPACITY);
     let (server_events_tx, server_events_rx) = mpsc::sync_channel(CLIENT_SERVER_CAPACITY);
     let mut connection_generation = 1;
@@ -159,8 +165,37 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
     let mut last_heartbeat_sent = Instant::now();
     let mut last_heartbeat_ack = Instant::now();
     let mut consecutive_input_events = 0;
+    let mut paste_detector = PasteDetector::default();
+    // ponytail: buffer user-owned input only for one cancellable, idle-timed upload.
+    let mut pending_clipboard_input = Vec::new();
+    let mut clipboard_activity = None;
+    let mut active_upload: Option<ActiveUpload> = None;
+    let mut next_upload_id = 1_u64;
+    let mut replay_input = None;
     loop {
         let now = Instant::now();
+        if active_upload
+            .as_ref()
+            .is_some_and(|upload| now >= upload.deadline)
+        {
+            let mut upload = active_upload.take().expect("checked above");
+            upload.control.cancel();
+            prepend_input(
+                &mut pending_clipboard_input,
+                std::mem::take(&mut upload.original),
+            );
+            clipboard_activity = Some(ClipboardActivity::Failed(
+                "clipboard upload timed out".to_string(),
+            ));
+            draw_input_status(
+                &mut stdout,
+                &mut input,
+                &view,
+                &session_name,
+                clipboard_activity.as_ref(),
+                pending_clipboard_input.len(),
+            )?;
+        }
         if connected {
             if connection.try_wait()?.is_some() {
                 mark_reconnecting(
@@ -214,6 +249,14 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                 Ok(mut new_connection) => {
                     connection_generation += 1;
                     writer = new_connection.writer.clone();
+                    uploader = new_connection.uploader();
+                    if let Some(upload) = active_upload.take() {
+                        upload.control.cancel();
+                    }
+                    clipboard_activity = None;
+                    pending_clipboard_input.clear();
+                    replay_input = None;
+                    paste_detector = PasteDetector::default();
                     spawn_server_reader(
                         new_connection.take_reader(),
                         server_events_tx.clone(),
@@ -259,11 +302,59 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
             draw_connection_status(&mut stdout, rows, cols, "snapshot timeout; reconnecting")?;
         }
 
-        match receive_client_event(
-            &input_events_rx,
-            &server_events_rx,
-            &mut consecutive_input_events,
-        ) {
+        if connected && clipboard_activity.is_none() {
+            let expired = paste_detector.feed(b"");
+            if !expired.is_empty() {
+                let previous_selection = input.selection_coordinates_if_active();
+                for event in expired {
+                    let bytes = match event {
+                        PasteEvent::Input(bytes) | PasteEvent::Paste(bytes) => bytes,
+                    };
+                    match dispatch_input_bytes(&writer, &mut input, &bytes) {
+                        Ok((true, _)) => {
+                            let _ = send(&writer, &ClientMessage::Detach);
+                            return Ok(());
+                        }
+                        Ok((false, renamed)) => {
+                            if let Some(name) = renamed {
+                                session_name = name;
+                            }
+                        }
+                        Err(error) => {
+                            mark_reconnecting(
+                                &mut connection,
+                                &mut connected,
+                                &mut waiting_snapshot,
+                                &mut next_reconnect,
+                                Instant::now(),
+                            );
+                            draw_connection_status(
+                                &mut stdout,
+                                rows,
+                                cols,
+                                &format!("input failed: {error}; reconnecting"),
+                            )?;
+                            break;
+                        }
+                    }
+                }
+                let current_selection = input.selection_coordinates_if_active();
+                if previous_selection != current_selection {
+                    view.redraw_selection(&mut stdout, previous_selection, current_selection)?;
+                }
+                continue;
+            }
+        }
+
+        let event = match replay_input.take() {
+            Some(bytes) => Ok(ClientEvent::Input(bytes)),
+            None => receive_client_event(
+                &input_events_rx,
+                &server_events_rx,
+                &mut consecutive_input_events,
+            ),
+        };
+        match event {
             Ok(ClientEvent::Input(bytes)) => {
                 if !connected {
                     if bytes.contains(&0x1b) {
@@ -271,19 +362,117 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                     }
                     continue;
                 }
+                if let Some(activity) = clipboard_activity.as_ref() {
+                    if active_upload.is_some() && bytes == b"\x1b" {
+                        let upload = active_upload.take().expect("checked above");
+                        upload.control.cancel();
+                        clipboard_activity = None;
+                        let queued = std::mem::take(&mut pending_clipboard_input);
+                        if !queued.is_empty() {
+                            replay_input = Some(queued);
+                        }
+                        draw_input_status(&mut stdout, &mut input, &view, &session_name, None, 0)?;
+                        continue;
+                    }
+                    if matches!(activity, ClipboardActivity::Failed(_)) && bytes == b"\x1b" {
+                        clipboard_activity = None;
+                        pending_clipboard_input.clear();
+                        draw_input_status(&mut stdout, &mut input, &view, &session_name, None, 0)?;
+                        continue;
+                    }
+                    if matches!(activity, ClipboardActivity::Failed(_))
+                        && (bytes == b"\r" || bytes == b"\n")
+                    {
+                        let queued = std::mem::take(&mut pending_clipboard_input);
+                        clipboard_activity = None;
+                        let mut dispatch_error = None;
+                        for queued_bytes in [queued, bytes] {
+                            match dispatch_input_bytes(&writer, &mut input, &queued_bytes) {
+                                Ok((true, _)) => {
+                                    let _ = send(&writer, &ClientMessage::Detach);
+                                    return Ok(());
+                                }
+                                Ok((false, renamed)) => {
+                                    if let Some(name) = renamed {
+                                        session_name = name;
+                                    }
+                                }
+                                Err(error) => {
+                                    dispatch_error = Some(error);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(error) = dispatch_error {
+                            mark_reconnecting(
+                                &mut connection,
+                                &mut connected,
+                                &mut waiting_snapshot,
+                                &mut next_reconnect,
+                                Instant::now(),
+                            );
+                            draw_connection_status(
+                                &mut stdout,
+                                rows,
+                                cols,
+                                &format!("input failed: {error}; reconnecting"),
+                            )?;
+                            continue;
+                        }
+                        draw_input_status(&mut stdout, &mut input, &view, &session_name, None, 0)?;
+                        continue;
+                    }
+                    pending_clipboard_input.extend_from_slice(&bytes);
+                    draw_input_status(
+                        &mut stdout,
+                        &mut input,
+                        &view,
+                        &session_name,
+                        Some(activity),
+                        pending_clipboard_input.len(),
+                    )?;
+                    continue;
+                }
                 let previous_selection = input.selection_coordinates_if_active();
                 let mut reconnect_error = None;
-                for action in input.feed(&bytes) {
-                    let renamed_session = match &action {
-                        InputAction::Message(ClientMessage::Rename { name }) => Some(name.clone()),
-                        _ => None,
+                for event in paste_detector.feed(&bytes) {
+                    let raw = match event {
+                        PasteEvent::Paste(bytes)
+                            if clipboard_activity.is_none() && uploader.is_some() =>
+                        {
+                            let upload_id = next_upload_id;
+                            next_upload_id = next_upload_id.wrapping_add(1).max(1);
+                            let control = UploadControl::default();
+                            active_upload = Some(ActiveUpload {
+                                id: upload_id,
+                                control: control.clone(),
+                                original: bytes.clone(),
+                                deadline: Instant::now() + CLIPBOARD_UPLOAD_IDLE_TIMEOUT,
+                            });
+                            clipboard_activity = Some(ClipboardActivity::Reading);
+                            spawn_clipboard_worker(
+                                input_events_tx.clone(),
+                                connection_generation,
+                                upload_id,
+                                uploader.clone().expect("checked above"),
+                                control,
+                                bytes,
+                                config.clipboard_upload_max_bytes,
+                            );
+                            continue;
+                        }
+                        PasteEvent::Input(bytes) | PasteEvent::Paste(bytes) => bytes,
                     };
-                    match handle_action(&writer, action) {
-                        Ok(true) => {
+                    if clipboard_activity.is_some() {
+                        pending_clipboard_input.extend_from_slice(&raw);
+                        continue;
+                    }
+                    match dispatch_input_bytes(&writer, &mut input, &raw) {
+                        Ok((true, _)) => {
                             let _ = send(&writer, &ClientMessage::Detach);
                             return Ok(());
                         }
-                        Ok(false) => {
+                        Ok((false, renamed_session)) => {
                             if let Some(name) = renamed_session {
                                 session_name = name;
                             }
@@ -314,8 +503,104 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                 if previous_selection != current_selection {
                     view.redraw_selection(&mut stdout, previous_selection, current_selection)?;
                 }
-                draw_input_status(&mut stdout, &mut input, &view, &session_name)?;
+                draw_input_status(
+                    &mut stdout,
+                    &mut input,
+                    &view,
+                    &session_name,
+                    clipboard_activity.as_ref(),
+                    pending_clipboard_input.len(),
+                )?;
             }
+            Ok(ClientEvent::UploadProgress {
+                generation,
+                upload_id,
+                name,
+                sent,
+                total,
+            }) if connected
+                && generation == connection_generation
+                && active_upload
+                    .as_ref()
+                    .is_some_and(|upload| upload.id == upload_id) =>
+            {
+                if let Some(upload) = active_upload.as_mut() {
+                    upload.deadline = Instant::now() + CLIPBOARD_UPLOAD_IDLE_TIMEOUT;
+                }
+                clipboard_activity = Some(ClipboardActivity::Uploading { name, sent, total });
+                draw_input_status(
+                    &mut stdout,
+                    &mut input,
+                    &view,
+                    &session_name,
+                    clipboard_activity.as_ref(),
+                    pending_clipboard_input.len(),
+                )?;
+            }
+            Ok(ClientEvent::UploadFinished {
+                generation,
+                upload_id,
+                result,
+            }) if connected
+                && generation == connection_generation
+                && active_upload
+                    .as_ref()
+                    .is_some_and(|upload| upload.id == upload_id) =>
+            {
+                let mut upload = active_upload.take().expect("checked above");
+                match result {
+                    Ok(pasted) => {
+                        clipboard_activity = None;
+                        match dispatch_input_bytes(&writer, &mut input, &pasted) {
+                            Ok((true, _)) => {
+                                let _ = send(&writer, &ClientMessage::Detach);
+                                return Ok(());
+                            }
+                            Ok((false, renamed_session)) => {
+                                if let Some(name) = renamed_session {
+                                    session_name = name;
+                                }
+                                let queued = std::mem::take(&mut pending_clipboard_input);
+                                if !queued.is_empty() {
+                                    replay_input = Some(queued);
+                                }
+                            }
+                            Err(error) => {
+                                mark_reconnecting(
+                                    &mut connection,
+                                    &mut connected,
+                                    &mut waiting_snapshot,
+                                    &mut next_reconnect,
+                                    Instant::now(),
+                                );
+                                draw_connection_status(
+                                    &mut stdout,
+                                    rows,
+                                    cols,
+                                    &format!("input failed: {error}; reconnecting"),
+                                )?;
+                                continue;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        prepend_input(
+                            &mut pending_clipboard_input,
+                            std::mem::take(&mut upload.original),
+                        );
+                        clipboard_activity = Some(ClipboardActivity::Failed(error));
+                    }
+                }
+                draw_input_status(
+                    &mut stdout,
+                    &mut input,
+                    &view,
+                    &session_name,
+                    clipboard_activity.as_ref(),
+                    pending_clipboard_input.len(),
+                )?;
+            }
+            Ok(ClientEvent::UploadProgress { .. }) | Ok(ClientEvent::UploadFinished { .. }) => {}
             Ok(ClientEvent::TerminalResized) => {
                 if refresh_terminal_size(&mut input, &mut view, &mut rows, &mut cols)? && connected
                 {
@@ -346,6 +631,10 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                     &mut view,
                     &mut stdout,
                     &session_name,
+                    ClipboardUi {
+                        activity: clipboard_activity.as_ref(),
+                        queued: pending_clipboard_input.len(),
+                    },
                     message,
                 )? {
                     ServerAction::Detached | ServerAction::SessionFinished => break,
@@ -439,12 +728,18 @@ enum ServerAction {
     SessionFinished,
 }
 
+struct ClipboardUi<'a> {
+    activity: Option<&'a ClipboardActivity>,
+    queued: usize,
+}
+
 fn handle_server_message(
     config: &Config,
     input: &mut InputState,
     view: &mut TerminalView,
     stdout: &mut impl Write,
     session_name: &str,
+    clipboard_ui: ClipboardUi<'_>,
     message: ServerMessage,
 ) -> Result<ServerAction> {
     match message {
@@ -465,7 +760,14 @@ fn handle_server_message(
             stdout.write_all(data.as_bytes())?;
             view.redraw_selection(stdout, None, input.selection_coordinates_if_active())?;
             stdout.flush()?;
-            draw_input_status(stdout, input, view, session_name)?;
+            draw_input_status(
+                stdout,
+                input,
+                view,
+                session_name,
+                clipboard_ui.activity,
+                clipboard_ui.queued,
+            )?;
             Ok(ServerAction::Snapshot)
         }
         ServerMessage::Detached => Ok(ServerAction::Detached),
@@ -542,10 +844,16 @@ fn draw_input_status(
     input: &mut InputState,
     view: &TerminalView,
     session_name: &str,
+    activity: Option<&ClipboardActivity>,
+    queued: usize,
 ) -> Result<()> {
-    let status = input
-        .status_text()
-        .map(|status| format!("{session_name} | {status}"));
+    let status = activity
+        .map(|activity| format!("{session_name} | {}", activity.text(queued)))
+        .or_else(|| {
+            input
+                .status_text()
+                .map(|status| format!("{session_name} | {status}"))
+        });
     if status.is_none() && !input.status_drawn {
         return Ok(());
     }
@@ -622,8 +930,14 @@ fn create_session_if_missing(config: &Config, name: &str, rows: u16, cols: u16) 
     }
 }
 
-fn create_session_if_missing_ssh(target: &str, name: &str, rows: u16, cols: u16) -> Result<()> {
-    let exists = match remote_request(target, true, ClientMessage::List)? {
+fn create_session_if_missing_ssh(
+    config: &Config,
+    target: &str,
+    name: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<()> {
+    let exists = match remote_request(config, target, true, ClientMessage::List)? {
         ServerMessage::Sessions { names } => names.iter().any(|session| session == name),
         ServerMessage::Error { message } => return Err(message.into()),
         response => return Err(format!("unexpected session list response: {response:?}").into()),
@@ -632,6 +946,7 @@ fn create_session_if_missing_ssh(target: &str, name: &str, rows: u16, cols: u16)
         return Ok(());
     }
     match remote_request(
+        config,
         target,
         true,
         ClientMessage::Create {
@@ -649,8 +964,13 @@ fn create_session_if_missing_ssh(target: &str, name: &str, rows: u16, cols: u16)
     }
 }
 
-fn remote_request(target: &str, start: bool, message: ClientMessage) -> Result<ServerMessage> {
-    let mut connection = Connection::ssh(target, start)?;
+fn remote_request(
+    config: &Config,
+    target: &str,
+    start: bool,
+    message: ClientMessage,
+) -> Result<ServerMessage> {
+    let mut connection = Connection::ssh(config, target, start)?;
     {
         let mut writer = connection
             .writer
@@ -711,6 +1031,183 @@ enum ClientEvent {
         generation: u64,
         message: String,
     },
+    UploadProgress {
+        generation: u64,
+        upload_id: u64,
+        name: String,
+        sent: u64,
+        total: u64,
+    },
+    UploadFinished {
+        generation: u64,
+        upload_id: u64,
+        result: std::result::Result<Vec<u8>, String>,
+    },
+}
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+enum PasteEvent {
+    Input(Vec<u8>),
+    Paste(Vec<u8>),
+}
+
+#[derive(Default)]
+struct PasteDetector {
+    partial: Vec<u8>,
+    partial_since: Option<Instant>,
+    pending: Vec<u8>,
+    paste_updated: Option<Instant>,
+    active: bool,
+}
+
+impl PasteDetector {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<PasteEvent> {
+        let now = Instant::now();
+        let mut events = self.flush_expired(now);
+        if bytes.is_empty() {
+            return events;
+        }
+        let mut combined = std::mem::take(&mut self.partial);
+        self.partial_since = None;
+        combined.extend_from_slice(bytes);
+        let mut input = combined.as_slice();
+        while !input.is_empty() {
+            if self.active {
+                if let Some(offset) = find_bytes(input, PASTE_END) {
+                    self.pending
+                        .extend_from_slice(&input[..offset + PASTE_END.len()]);
+                    events.push(PasteEvent::Paste(std::mem::take(&mut self.pending)));
+                    self.active = false;
+                    self.paste_updated = None;
+                    input = &input[offset + PASTE_END.len()..];
+                } else {
+                    self.pending.extend_from_slice(input);
+                    self.paste_updated = Some(now);
+                    if self.pending.len() > MAX_DETECTED_PASTE_BYTES {
+                        events.push(PasteEvent::Input(std::mem::take(&mut self.pending)));
+                        self.active = false;
+                        self.paste_updated = None;
+                    }
+                    break;
+                }
+            } else if let Some(offset) = find_bytes(input, PASTE_START) {
+                if offset > 0 {
+                    events.push(PasteEvent::Input(input[..offset].to_vec()));
+                }
+                self.pending
+                    .extend_from_slice(&input[offset..offset + PASTE_START.len()]);
+                self.active = true;
+                self.paste_updated = Some(now);
+                input = &input[offset + PASTE_START.len()..];
+            } else {
+                let keep = partial_prefix_len(input, PASTE_START);
+                if keep > 0 {
+                    if input.len() > keep {
+                        events.push(PasteEvent::Input(input[..input.len() - keep].to_vec()));
+                    }
+                    self.partial.extend_from_slice(&input[input.len() - keep..]);
+                    self.partial_since = Some(now);
+                } else {
+                    events.push(PasteEvent::Input(input.to_vec()));
+                }
+                break;
+            }
+        }
+        events
+    }
+
+    fn flush_expired(&mut self, now: Instant) -> Vec<PasteEvent> {
+        let mut events = Vec::new();
+        if self.active
+            && self
+                .paste_updated
+                .is_some_and(|updated| now.duration_since(updated) >= PASTE_IDLE_TIMEOUT)
+        {
+            events.push(PasteEvent::Input(std::mem::take(&mut self.pending)));
+            self.active = false;
+            self.paste_updated = None;
+        }
+        if self
+            .partial_since
+            .is_some_and(|started| now.duration_since(started) >= PASTE_PREFIX_TIMEOUT)
+        {
+            events.push(PasteEvent::Input(std::mem::take(&mut self.partial)));
+            self.partial_since = None;
+        }
+        events
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn partial_prefix_len(bytes: &[u8], marker: &[u8]) -> usize {
+    (1..bytes.len().min(marker.len().saturating_sub(1)) + 1)
+        .rev()
+        .find(|length| bytes.ends_with(&marker[..*length]))
+        .unwrap_or(0)
+}
+
+enum ClipboardActivity {
+    Reading,
+    Uploading { name: String, sent: u64, total: u64 },
+    Failed(String),
+}
+
+struct ActiveUpload {
+    id: u64,
+    control: UploadControl,
+    original: Vec<u8>,
+    deadline: Instant,
+}
+
+impl Drop for ActiveUpload {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
+}
+
+impl ClipboardActivity {
+    fn text(&self, queued: usize) -> String {
+        let queued = format!(" | input queued: {queued} B");
+        match self {
+            Self::Reading => format!("clipboard: reading…{queued} | Esc: cancel"),
+            Self::Uploading { name, sent, total } => format!(
+                "uploading {name} {}% ({} / {}){queued} | Esc: cancel",
+                sent.saturating_mul(100) / (*total).max(1),
+                format_bytes(*sent),
+                format_bytes(*total),
+            ),
+            Self::Failed(message) => {
+                format!("clipboard failed: {message} | Enter: continue, Esc: discard")
+            }
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn prepend_input(pending: &mut Vec<u8>, mut prefix: Vec<u8>) {
+    prefix.append(pending);
+    *pending = prefix;
 }
 
 fn send(writer: &ClientWriter, message: &ClientMessage) -> Result<()> {
@@ -819,6 +1316,75 @@ fn spawn_stdin_reader(events: mpsc::SyncSender<ClientEvent>) {
             }
         })
         .expect("failed to spawn stdin reader thread");
+}
+
+fn spawn_clipboard_worker(
+    events: mpsc::SyncSender<ClientEvent>,
+    generation: u64,
+    upload_id: u64,
+    uploader: SshUploader,
+    control: UploadControl,
+    original: Vec<u8>,
+    max_bytes: usize,
+) {
+    thread::Builder::new()
+        .name("plux-clipboard-upload".to_string())
+        .spawn(move || {
+            let result = (|| -> Result<Vec<u8>> {
+                match crate::clipboard::read()? {
+                    ClipboardPayload::Text => Ok(original),
+                    ClipboardPayload::Items(items) => {
+                        let total = items.iter().try_fold(0_u64, |total, item| {
+                            total
+                                .checked_add(item.size())
+                                .ok_or("clipboard upload size overflow")
+                        })?;
+                        if total > max_bytes as u64 {
+                            return Err("clipboard upload is too large".into());
+                        }
+                        let items = items
+                            .into_iter()
+                            .map(|item| {
+                                let (name, size, reader) = item.into_reader()?;
+                                Ok(UploadItem { name, size, reader })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let mut last_name = String::new();
+                        let mut last_progress = Instant::now();
+                        let paths = uploader.upload(items, &control, |name, sent, total| {
+                            if name != last_name
+                                || last_progress.elapsed() >= Duration::from_millis(100)
+                                || sent == total
+                            {
+                                last_name.clear();
+                                last_name.push_str(name);
+                                last_progress = Instant::now();
+                                let _ = events.send(ClientEvent::UploadProgress {
+                                    generation,
+                                    upload_id,
+                                    name: name.to_string(),
+                                    sent,
+                                    total,
+                                });
+                            }
+                        })?;
+                        let pasted = paths.join(" ");
+                        let mut bytes =
+                            Vec::with_capacity(PASTE_START.len() + pasted.len() + PASTE_END.len());
+                        bytes.extend_from_slice(PASTE_START);
+                        bytes.extend_from_slice(pasted.as_bytes());
+                        bytes.extend_from_slice(PASTE_END);
+                        Ok(bytes)
+                    }
+                }
+            })();
+            let _ = events.send(ClientEvent::UploadFinished {
+                generation,
+                upload_id,
+                result: result.map_err(|error| error.to_string()),
+            });
+        })
+        .expect("failed to spawn clipboard worker");
 }
 
 fn spawn_signal_reader(events: mpsc::SyncSender<ClientEvent>) -> Result<()> {
@@ -1561,6 +2127,23 @@ fn handle_action(writer: &ClientWriter, action: InputAction) -> Result<bool> {
     Ok(false)
 }
 
+fn dispatch_input_bytes(
+    writer: &ClientWriter,
+    input: &mut InputState,
+    bytes: &[u8],
+) -> Result<(bool, Option<String>)> {
+    let mut renamed = None;
+    for action in input.feed(bytes) {
+        if let InputAction::Message(ClientMessage::Rename { name }) = &action {
+            renamed = Some(name.clone());
+        }
+        if handle_action(writer, action)? {
+            return Ok((true, renamed));
+        }
+    }
+    Ok((false, renamed))
+}
+
 fn copy_to_clipboard(config: &Config, text: &str) -> Result<()> {
     let candidates = if let Some(command) = config.copy_command.as_deref() {
         vec![(command.to_string(), Vec::new())]
@@ -1671,8 +2254,8 @@ mod tests {
     use std::{os::unix::net::UnixStream, sync::mpsc, time::Duration};
 
     use super::{
-        draw_input_status, spawn_server_reader, ClientEvent, InputAction, InputState, TerminalView,
-        MOUSE_CAPTURE_ENABLE,
+        draw_input_status, spawn_server_reader, ClientEvent, InputAction, InputState,
+        PasteDetector, PasteEvent, TerminalView, MOUSE_CAPTURE_ENABLE,
     };
     use crate::protocol::{ClientMessage, ServerMessage};
 
@@ -1691,6 +2274,56 @@ mod tests {
             actions.as_slice(),
             [InputAction::Forward(bytes)] if bytes == b"echo hi\r"
         ));
+    }
+
+    #[test]
+    fn paste_detector_handles_split_markers() {
+        let mut detector = PasteDetector::default();
+        assert!(detector
+            .feed(b"before\x1b[200")
+            .iter()
+            .any(|event| matches!(
+                event,
+                PasteEvent::Input(bytes) if bytes == b"before"
+            )));
+        let events = detector.feed(b"~image.png\x1b[201~after");
+        assert!(matches!(
+            events.as_slice(),
+            [PasteEvent::Paste(paste), PasteEvent::Input(after)]
+                if paste == b"\x1b[200~image.png\x1b[201~" && after == b"after"
+        ));
+    }
+
+    #[test]
+    fn paste_detector_releases_a_lone_escape() {
+        let mut detector = PasteDetector::default();
+        let _ = detector.feed(b"\x1b");
+        std::thread::sleep(Duration::from_millis(30));
+
+        let events = detector.feed(b"");
+        assert!(matches!(
+            events.as_slice(),
+            [PasteEvent::Input(bytes)] if bytes == b"\x1b"
+        ));
+    }
+
+    #[test]
+    fn paste_detector_accepts_a_second_paste_after_the_first() {
+        let mut detector = PasteDetector::default();
+        let first = detector.feed(b"\x1b[200~one.png\x1b[201~");
+        let second = detector.feed(b"\x1b[200~two.png\x1b[201~");
+
+        assert!(matches!(first.as_slice(), [PasteEvent::Paste(_)]));
+        assert!(matches!(second.as_slice(), [PasteEvent::Paste(_)]));
+    }
+
+    #[test]
+    fn paste_detector_falls_back_for_oversized_unclosed_paste() {
+        let mut detector = PasteDetector::default();
+        let mut bytes = b"\x1b[200~".to_vec();
+        bytes.resize(super::MAX_DETECTED_PASTE_BYTES + 1, b'x');
+        let events = detector.feed(&bytes);
+        assert!(matches!(events.as_slice(), [PasteEvent::Input(_)]));
     }
 
     #[test]
@@ -1808,7 +2441,7 @@ mod tests {
         input.status_drawn = true;
         let mut rendered = Vec::new();
 
-        draw_input_status(&mut rendered, &mut input, &view, "work").unwrap();
+        draw_input_status(&mut rendered, &mut input, &view, "work", None, 0).unwrap();
 
         assert!(String::from_utf8_lossy(&rendered).contains("bottom"));
     }
@@ -1821,7 +2454,7 @@ mod tests {
         input.enter_scroll_mode();
         let mut rendered = Vec::new();
 
-        draw_input_status(&mut rendered, &mut input, &view, "work").unwrap();
+        draw_input_status(&mut rendered, &mut input, &view, "work", None, 0).unwrap();
 
         let rendered = String::from_utf8_lossy(&rendered);
         assert!(rendered.contains("work | scroll:"));

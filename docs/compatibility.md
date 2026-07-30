@@ -40,6 +40,9 @@ smoke test remains pending.
   the SSH bridge described in the README.
 - History search advances in bounded daemon steps; very large histories still
   require more steps and may take longer to complete.
+- Remote clipboard image/file upload relies on the outer terminal delivering
+  bracketed-paste markers. If the terminal or focused application does not
+  enable bracketed paste, Plux cannot distinguish a pasted path from typed text.
 
 ## Terminal Query Replies
 

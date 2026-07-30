@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added remote SSH clipboard image/file uploads with progress, cancellation,
+  ordered input replay, transactional cleanup and expiring temporary files;
+  bumped the client/daemon protocol to version 4.
 - Preserved ordered snapshots and final PTY output under slow-client backpressure.
 - Coalesced terminal resize bursts, bounded PTY input/output queues, and hardened
   reconnect and bridge lifecycle handling.

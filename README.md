@@ -55,6 +55,15 @@ typed while reconnecting is discarded instead of replayed, so commands cannot
 be executed twice accidentally. Starting another client for the same session
 automatically replaces the older client.
 
+During remote attach, bracketed text pastes keep their original bytes. A local
+clipboard image or file paste is uploaded over a multiplexed SSH channel and
+the remote temporary path is inserted into the focused application. The bottom
+status line shows reading/upload progress; `Esc` cancels an active upload, and
+input typed while it runs is replayed in order after completion. The default
+upload limit is 64 MiB and can be changed with `clipboard_upload_max_bytes`.
+Remote copies use mode `0600`; files older than 24 hours are removed when the
+next upload starts.
+
 ## Default Keys
 
 The default prefix is `Ctrl-A`. Set `prefix = "Ctrl-]"` or
@@ -107,6 +116,7 @@ scrollback_bytes = "64MB"
 mouse = true
 refresh_rate = 60
 copy_command = "wl-copy"
+clipboard_upload_max_bytes = "64MB"
 ```
 
 The current implementation primarily supports UTF-8 and standard ANSI/VT terminal behavior. It answers basic status, cursor-position, device-attributes, and character-cell-size queries. It does not automatically detect GBK/Big5, provide Windows support, restore shells after a daemon crash, or support terminal graphics protocols.

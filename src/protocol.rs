@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::error::Result;
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 pub const CLIENT_TOKEN_LENGTH: usize = 32;
 const MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
 
