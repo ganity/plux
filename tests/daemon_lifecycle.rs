@@ -181,6 +181,36 @@ fn wait_for_heartbeat<R: Read>(stream: &mut R) {
 }
 
 #[test]
+fn osc52_copy_from_pane_reaches_attached_client() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "osc52-copy",
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 1; printf '\\033]52;c;Q2xhdWRlIOWkjeWItuaWh+acrA==\\007'; sleep 30".to_string(),
+        ],
+    );
+
+    let mut attached = test.attach("osc52-copy");
+    attached
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    for _ in 0..20 {
+        match read_message(&mut attached) {
+            Ok(Some(ServerMessage::Copied { text })) => {
+                assert_eq!(text, "Claude 复制文本");
+                return;
+            }
+            Ok(Some(ServerMessage::Snapshot { .. })) => {}
+            response => panic!("OSC 52 copy was not forwarded: {response:?}"),
+        }
+    }
+    panic!("OSC 52 copy was not forwarded");
+}
+
+#[test]
 fn resize_burst_is_coalesced_without_detaching_client() {
     let test = TestDaemon::start();
     assert!(test.cli(&["new", "resize-burst"]).status.success());

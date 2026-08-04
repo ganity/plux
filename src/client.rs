@@ -2145,10 +2145,27 @@ fn dispatch_input_bytes(
 }
 
 fn copy_to_clipboard(config: &Config, text: &str) -> Result<()> {
+    let mut stdout = io::stdout();
+    copy_to_clipboard_with(config, text, crate::clipboard::write_text, &mut stdout)
+}
+
+fn copy_to_clipboard_with<F, W>(
+    config: &Config,
+    text: &str,
+    write_native: F,
+    stdout: &mut W,
+) -> Result<()>
+where
+    F: FnOnce(&str) -> Result<()>,
+    W: Write + ?Sized,
+{
     let candidates = if let Some(command) = config.copy_command.as_deref() {
         vec![(command.to_string(), Vec::new())]
     } else if cfg!(target_os = "macos") {
-        vec![("pbcopy".to_string(), Vec::new())]
+        if write_native(text).is_ok() {
+            return Ok(());
+        }
+        Vec::new()
     } else {
         let mut candidates = Vec::new();
         if env::var_os("WAYLAND_DISPLAY").is_some() {
@@ -2185,7 +2202,6 @@ fn copy_to_clipboard(config: &Config, text: &str) -> Result<()> {
         }
     }
     let encoded = base64_encode(text.as_bytes());
-    let mut stdout = io::stdout();
     write!(stdout, "\x1b]52;c;{encoded}\x07")?;
     stdout.flush()?;
     Ok(())
@@ -2257,7 +2273,10 @@ mod tests {
         draw_input_status, spawn_server_reader, ClientEvent, InputAction, InputState,
         PasteDetector, PasteEvent, TerminalView, MOUSE_CAPTURE_ENABLE,
     };
-    use crate::protocol::{ClientMessage, ServerMessage};
+    use crate::{
+        config::Config,
+        protocol::{ClientMessage, ServerMessage},
+    };
 
     #[test]
     fn prefix_detaches_without_forwarding() {
@@ -2834,5 +2853,28 @@ mod tests {
     #[test]
     fn clipboard_fallback_encoding_is_valid() {
         assert_eq!(super::base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_copy_passes_unicode_to_native_clipboard() {
+        let config = Config::default();
+        let text = "可在方案里正常复制中文";
+        let mut copied = None;
+        let mut stdout = Vec::new();
+
+        super::copy_to_clipboard_with(
+            &config,
+            text,
+            |value: &str| {
+                copied = Some(value.to_string());
+                Ok(())
+            },
+            &mut stdout,
+        )
+        .unwrap();
+
+        assert_eq!(copied.as_deref(), Some(text));
+        assert!(stdout.is_empty());
     }
 }

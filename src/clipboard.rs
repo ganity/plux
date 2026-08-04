@@ -83,3 +83,9 @@ pub fn read() -> Result<ClipboardPayload> {
     }
     Err("clipboard does not contain text, images, or files".into())
 }
+
+pub fn write_text(text: &str) -> Result<()> {
+    let clipboard = ClipboardContext::new()?;
+    clipboard.set_text(text.to_string())?;
+    Ok(())
+}

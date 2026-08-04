@@ -174,7 +174,7 @@ impl Pane {
         self.input.enqueue(bytes)
     }
 
-    pub fn process_output(&mut self, bytes: &[u8]) {
+    pub fn process_output(&mut self, bytes: &[u8]) -> Vec<String> {
         let was_scrolled = self.terminal.is_scrolled();
         self.terminal.process(bytes);
         for reply in self.terminal.take_replies() {
@@ -186,6 +186,7 @@ impl Pane {
         } else {
             self.unread_output = 0;
         }
+        self.terminal.take_clipboard_copies()
     }
 
     pub fn clear_unread(&mut self) {
@@ -374,7 +375,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("PTY event stream closed: {error}"))
             {
                 PaneEvent::Output { bytes, .. } => {
-                    pane.process_output(&bytes);
+                    let _ = pane.process_output(&bytes);
                     if pane.terminal.contents().contains("DSR_OK") {
                         return;
                     }

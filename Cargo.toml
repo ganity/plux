@@ -6,6 +6,7 @@ description = "A small terminal multiplexer"
 license = "MIT"
 
 [dependencies]
+base64 = "0.22.1"
 clipboard-rs = { version = "0.3.5", features = ["wayland"] }
 crossterm = "0.29"
 portable-pty = "0.9"

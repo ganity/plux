@@ -1105,15 +1105,22 @@ impl Daemon {
 
         match event {
             PaneEvent::Output { bytes, .. } => {
-                let attached = if let Some(session) = self.sessions.get_mut(&session_name) {
-                    if let Some(pane) = session.pane_mut(pane_id) {
-                        pane.process_output(&bytes);
-                    }
-                    session.attached
-                } else {
-                    false
-                };
+                let (attached, clipboard_copies) =
+                    if let Some(session) = self.sessions.get_mut(&session_name) {
+                        let clipboard_copies = session
+                            .pane_mut(pane_id)
+                            .map(|pane| pane.process_output(&bytes))
+                            .unwrap_or_default();
+                        (session.attached, clipboard_copies)
+                    } else {
+                        (false, Vec::new())
+                    };
                 if attached {
+                    if let Some(client_id) = self.client_id_for_session(&session_name) {
+                        for text in clipboard_copies {
+                            self.send_to(client_id, ServerMessage::Copied { text })?;
+                        }
+                    }
                     self.pending_snapshots.insert(session_name);
                 }
             }

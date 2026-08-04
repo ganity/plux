@@ -1,5 +1,9 @@
 use std::collections::VecDeque;
 
+use base64::{
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+    Engine as _,
+};
 use vt100::{Callbacks, Parser, Screen};
 
 use crate::protocol::CopyMode;
@@ -36,6 +40,10 @@ impl TerminalState {
 
     pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
         self.parser.callbacks_mut().take_replies()
+    }
+
+    pub fn take_clipboard_copies(&mut self) -> Vec<String> {
+        self.parser.callbacks_mut().take_clipboard_copies()
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -175,6 +183,7 @@ const MAX_REPLY_BYTES: usize = 64 * 1024;
 #[derive(Default)]
 struct TerminalCallbacks {
     replies: VecDeque<Vec<u8>>,
+    clipboard_copies: VecDeque<String>,
     reply_bytes: usize,
     overflowed: bool,
 }
@@ -183,6 +192,10 @@ impl TerminalCallbacks {
     fn take_replies(&mut self) -> Vec<Vec<u8>> {
         self.reply_bytes = 0;
         self.replies.drain(..).collect()
+    }
+
+    fn take_clipboard_copies(&mut self) -> Vec<String> {
+        self.clipboard_copies.drain(..).collect()
     }
 
     fn push_reply(&mut self, reply: Vec<u8>) {
@@ -196,6 +209,18 @@ impl TerminalCallbacks {
 }
 
 impl Callbacks for TerminalCallbacks {
+    fn copy_to_clipboard(&mut self, _screen: &mut Screen, _ty: &[u8], data: &[u8]) {
+        let Ok(bytes) = STANDARD
+            .decode(data)
+            .or_else(|_| STANDARD_NO_PAD.decode(data))
+        else {
+            return;
+        };
+        if let Ok(text) = String::from_utf8(bytes) {
+            self.clipboard_copies.push_back(text);
+        }
+    }
+
     fn unhandled_csi(
         &mut self,
         screen: &mut Screen,
@@ -446,5 +471,22 @@ mod tests {
         terminal.process(b"\x1b[");
         terminal.process(b"5n");
         assert_eq!(terminal.take_replies(), vec![b"\x1b[0n".to_vec()]);
+    }
+
+    #[test]
+    fn osc52_copy_decodes_unpadded_utf8() {
+        let mut terminal = TerminalState::with_limits(2, 10, 10, usize::MAX);
+        terminal.process(b"\x1b]52;c;Q2xhdWRlIOWkjeWItuaWh+acrA\x07");
+
+        assert_eq!(terminal.take_clipboard_copies(), vec!["Claude 复制文本"]);
+    }
+
+    #[test]
+    fn unusable_osc52_copy_is_ignored() {
+        let mut terminal = TerminalState::with_limits(2, 10, 10, usize::MAX);
+        terminal.process(b"\x1b]52;c;A\x07");
+        terminal.process(b"\x1b]52;c;/w==\x07");
+
+        assert!(terminal.take_clipboard_copies().is_empty());
     }
 }
