@@ -81,6 +81,10 @@ impl TerminalState {
         self.parser.screen().scrollback() > 0
     }
 
+    pub fn scrollback(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
     pub fn has_scrollback(&mut self) -> bool {
         let original = self.parser.screen().scrollback();
         self.set_scrollback(usize::MAX);
@@ -129,35 +133,47 @@ impl TerminalState {
 
     pub fn selection_text(
         &self,
-        start_row: u16,
+        start_row: i32,
         start_col: u16,
-        end_row: u16,
+        end_row: i32,
         end_col: u16,
         mode: CopyMode,
     ) -> String {
-        let (start_row, start_col, end_row, end_col) =
+        let (mut start_row, mut start_col, mut end_row, mut end_col) =
             if (start_row, start_col) <= (end_row, end_col) {
                 (start_row, start_col, end_row, end_col)
             } else {
                 (end_row, end_col, start_row, start_col)
             };
+        let screen = self.parser.screen();
+        let (first_row, last_row) = screen.relative_row_bounds();
+        if end_row < first_row || start_row > last_row {
+            return String::new();
+        }
+        if start_row < first_row {
+            start_row = first_row;
+            start_col = 0;
+        }
+        if end_row > last_row {
+            end_row = last_row;
+            end_col = screen.size().1;
+        }
         match mode {
-            CopyMode::Character => self
-                .parser
-                .screen()
-                .contents_between(start_row, start_col, end_row, end_col),
-            CopyMode::Line => self.parser.screen().contents_between(
-                start_row,
-                0,
-                end_row,
-                self.parser.screen().size().1,
-            ),
-            CopyMode::Rectangle => self
-                .parser
-                .screen()
-                .rows(start_col, end_col.saturating_sub(start_col))
-                .skip(usize::from(start_row))
-                .take(usize::from(end_row - start_row + 1))
+            CopyMode::Character => {
+                selection_text_between(screen, start_row, start_col, end_row, end_col)
+            }
+            CopyMode::Line => {
+                selection_text_between(screen, start_row, 0, end_row, screen.size().1)
+            }
+            CopyMode::Rectangle => (start_row..=end_row)
+                .filter_map(|row| {
+                    screen.relative_row_contents(
+                        row,
+                        start_col,
+                        end_col.saturating_sub(start_col),
+                        false,
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n"),
         }
@@ -176,6 +192,40 @@ impl TerminalState {
     pub fn contents(&self) -> String {
         self.parser.screen().contents()
     }
+}
+
+fn selection_text_between(
+    screen: &Screen,
+    start_row: i32,
+    start_col: u16,
+    end_row: i32,
+    end_col: u16,
+) -> String {
+    let cols = screen.size().1;
+    let mut contents = String::new();
+    for row_index in start_row..=end_row {
+        let (start, width) = if start_row == end_row {
+            (start_col, end_col.saturating_sub(start_col))
+        } else if row_index == start_row {
+            (start_col, cols.saturating_sub(start_col))
+        } else if row_index == end_row {
+            (0, end_col)
+        } else {
+            (0, cols)
+        };
+        let Some(row_contents) = screen.relative_row_contents(row_index, start, width, false)
+        else {
+            continue;
+        };
+        contents.push_str(&row_contents);
+        if start_row != end_row
+            && row_index != end_row
+            && !screen.relative_row_wrapped(row_index).unwrap_or(false)
+        {
+            contents.push('\n');
+        }
+    }
+    contents
 }
 
 const MAX_REPLY_BYTES: usize = 64 * 1024;
@@ -438,6 +488,19 @@ mod tests {
             terminal.selection_text(0, 1, 1, 4, CopyMode::Rectangle),
             "bcd\nhij"
         );
+    }
+
+    #[test]
+    fn copies_selection_rows_above_the_current_viewport() {
+        let mut terminal = TerminalState::with_limits(3, 20, 10, usize::MAX);
+        terminal.process(b"zero\r\none\r\ntwo\r\nthree\r\nfour");
+
+        let copied = terminal.selection_text(-1, 0, 2, 20, CopyMode::Character);
+
+        assert!(copied.contains("one"));
+        assert!(copied.contains("two"));
+        assert!(copied.contains("three"));
+        assert!(copied.contains("four"));
     }
 
     #[test]

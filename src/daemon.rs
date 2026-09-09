@@ -852,23 +852,21 @@ impl Daemon {
                 Ok(())
             }
             ClientMessage::Scroll { rows } => {
-                self.with_focused_pane(client_id, |pane| {
-                    pane.terminal.scroll(rows);
-                    if !pane.terminal.is_scrolled() {
-                        pane.clear_unread();
-                    }
-                })?;
+                self.attached_session_mut(client_id)
+                    .ok_or("no attached session")?
+                    .scroll_focused(rows);
                 self.send_attached_snapshot(client_id)
             }
             ClientMessage::ScrollToTop => {
-                self.with_focused_pane(client_id, |pane| pane.terminal.scroll_to_top())?;
+                self.attached_session_mut(client_id)
+                    .ok_or("no attached session")?
+                    .scroll_focused_to_top();
                 self.send_attached_snapshot(client_id)
             }
             ClientMessage::ScrollToBottom => {
-                self.with_focused_pane(client_id, |pane| {
-                    pane.terminal.scroll_to_bottom();
-                    pane.clear_unread();
-                })?;
+                self.attached_session_mut(client_id)
+                    .ok_or("no attached session")?
+                    .scroll_focused_to_bottom();
                 self.send_attached_snapshot(client_id)
             }
             ClientMessage::Search { query, direction } => {
@@ -1289,6 +1287,8 @@ impl Daemon {
         let mouse_enabled = session.focused_mouse_enabled();
         let alternate_screen = session.focused_alternate_screen();
         let scrollback_available = session.focused_scrollback_available();
+        let scrollback = session.focused_scrollback();
+        let scroll_delta = session.take_pending_scroll_delta();
         let result = self.send_to(
             client_id,
             ServerMessage::Snapshot {
@@ -1298,6 +1298,8 @@ impl Daemon {
                 mouse_enabled,
                 alternate_screen,
                 scrollback_available,
+                scrollback,
+                scroll_delta,
             },
         );
         self.last_snapshot = Instant::now();

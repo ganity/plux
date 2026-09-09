@@ -354,6 +354,35 @@ fn real_client_survives_slow_outer_reader() {
 }
 
 #[test]
+fn real_client_continues_mouse_selection_scroll_at_bottom_edge() {
+    let mut test = ClientHarness::new(24, 80);
+    test.writer.write_all(b"stty -echo\r").unwrap();
+    test.writer.flush().unwrap();
+    thread::sleep(Duration::from_millis(100));
+    test.writer
+        .write_all(
+            b"i=1; while [ $i -le 80 ]; do printf 'PLUX_SELECT_%03d\\n' \"$i\"; i=$((i+1)); done\r",
+        )
+        .unwrap();
+    test.writer.flush().unwrap();
+    test.wait_for_output("PLUX_SELECT_080", Duration::from_secs(10));
+
+    test.writer.write_all(b"\x1b[5~\x1b[5~").unwrap();
+    test.writer.flush().unwrap();
+    test.wait_for_output("PLUX_SELECT_045", Duration::from_secs(5));
+
+    test.writer
+        .write_all(b"\x1b[<0;3;12M\x1b[<32;6;24M")
+        .unwrap();
+    test.writer.flush().unwrap();
+    test.wait_for_output("PLUX_SELECT_070", Duration::from_secs(5));
+
+    test.writer.write_all(b"\x1b[<0;6;24mq").unwrap();
+    test.writer.flush().unwrap();
+    test.detach();
+}
+
+#[test]
 fn real_client_split_survives_tiny_resize_and_restores() {
     let mut test = ClientHarness::new(24, 80);
     test.writer

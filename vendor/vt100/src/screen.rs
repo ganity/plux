@@ -501,6 +501,35 @@ impl Screen {
             .is_some_and(crate::row::Row::wrapped)
     }
 
+    /// Returns text from a row relative to the current viewport. Negative rows
+    /// address retained scrollback above the viewport; rows beyond the screen
+    /// address retained content below it.
+    #[must_use]
+    pub fn relative_row_contents(
+        &self,
+        row: i32,
+        start: u16,
+        width: u16,
+        wrapping: bool,
+    ) -> Option<String> {
+        let row = self.grid().relative_row(row)?;
+        let mut contents = String::new();
+        row.write_contents(&mut contents, start, width, wrapping);
+        Some(contents)
+    }
+
+    /// Returns whether a row relative to the current viewport is soft-wrapped.
+    #[must_use]
+    pub fn relative_row_wrapped(&self, row: i32) -> Option<bool> {
+        self.grid().relative_row(row).map(crate::row::Row::wrapped)
+    }
+
+    /// Returns the inclusive row bounds addressable by relative-row methods.
+    #[must_use]
+    pub fn relative_row_bounds(&self) -> (i32, i32) {
+        self.grid().relative_row_bounds()
+    }
+
     /// Returns whether the alternate screen is currently in use.
     #[must_use]
     pub fn alternate_screen(&self) -> bool {

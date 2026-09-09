@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::error::Result;
 
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 pub const CLIENT_TOKEN_LENGTH: usize = 32;
 const MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
 
@@ -51,9 +51,9 @@ pub enum ClientMessage {
         direction: i8,
     },
     Copy {
-        start_row: u16,
+        start_row: i32,
         start_col: u16,
-        end_row: u16,
+        end_row: i32,
         end_col: u16,
         mode: CopyMode,
     },
@@ -101,6 +101,11 @@ pub enum ServerMessage {
         alternate_screen: bool,
         #[serde(default)]
         scrollback_available: bool,
+        #[serde(default)]
+        scrollback: usize,
+        /// 仅表示用户显式滚动导致的视口位移，后台输出不计入其中。
+        #[serde(default)]
+        scroll_delta: i32,
     },
     Sessions {
         names: Vec<String>,
@@ -173,7 +178,9 @@ pub fn read_message<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<Opti
 
 #[cfg(test)]
 mod tests {
-    use super::{read_message, validate_client_token, write_message, ClientMessage, VERSION};
+    use super::{
+        read_message, validate_client_token, write_message, ClientMessage, ServerMessage, VERSION,
+    };
 
     #[test]
     fn round_trips_messages() {
@@ -184,6 +191,55 @@ mod tests {
         write_message(&mut encoded, &message).unwrap();
         let decoded: ClientMessage = read_message(&mut encoded.as_slice()).unwrap().unwrap();
         assert!(matches!(decoded, ClientMessage::Input { bytes } if bytes == vec![0, 1, 27, 255]));
+    }
+
+    #[test]
+    fn copy_round_trip_preserves_rows_outside_the_viewport() {
+        let message = ClientMessage::Copy {
+            start_row: -12,
+            start_col: 3,
+            end_row: 23,
+            end_col: 17,
+            mode: super::CopyMode::Character,
+        };
+        let mut encoded = Vec::new();
+        write_message(&mut encoded, &message).unwrap();
+        let decoded: ClientMessage = read_message(&mut encoded.as_slice()).unwrap().unwrap();
+        assert!(matches!(
+            decoded,
+            ClientMessage::Copy {
+                start_row: -12,
+                start_col: 3,
+                end_row: 23,
+                end_col: 17,
+                mode: super::CopyMode::Character,
+            }
+        ));
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_scroll_metadata() {
+        let message = ServerMessage::Snapshot {
+            rows: 24,
+            cols: 80,
+            data: "screen".to_string(),
+            mouse_enabled: false,
+            alternate_screen: false,
+            scrollback_available: true,
+            scrollback: 12,
+            scroll_delta: -3,
+        };
+        let mut encoded = Vec::new();
+        write_message(&mut encoded, &message).unwrap();
+        let decoded: ServerMessage = read_message(&mut encoded.as_slice()).unwrap().unwrap();
+        assert!(matches!(
+            decoded,
+            ServerMessage::Snapshot {
+                scrollback: 12,
+                scroll_delta: -3,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub struct Session {
     last_attached_at: u64,
     rendered_rows: HashMap<u64, Vec<Vec<u8>>>,
     force_full_render: bool,
+    pending_scroll_delta: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -112,6 +113,7 @@ impl Session {
             last_attached_at: 0,
             rendered_rows: HashMap::new(),
             force_full_render: true,
+            pending_scroll_delta: 0,
         })
     }
 
@@ -183,6 +185,59 @@ impl Session {
         self.panes
             .get_mut(&self.focused)
             .is_some_and(|pane| pane.terminal.has_scrollback())
+    }
+
+    pub fn focused_scrollback(&self) -> usize {
+        self.panes
+            .get(&self.focused)
+            .map_or(0, |pane| pane.terminal.scrollback())
+    }
+
+    pub fn scroll_focused(&mut self, delta: i32) {
+        let Some(pane) = self.panes.get_mut(&self.focused) else {
+            return;
+        };
+        let before = pane.terminal.scrollback() as i64;
+        pane.terminal.scroll(delta);
+        let after = pane.terminal.scrollback() as i64;
+        let applied = after - before;
+        self.pending_scroll_delta = (i64::from(self.pending_scroll_delta) + applied)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+            as i32;
+        if !pane.terminal.is_scrolled() {
+            pane.clear_unread();
+        }
+    }
+
+    pub fn scroll_focused_to_top(&mut self) {
+        let Some(pane) = self.panes.get_mut(&self.focused) else {
+            return;
+        };
+        let before = pane.terminal.scrollback() as i64;
+        pane.terminal.scroll_to_top();
+        let after = pane.terminal.scrollback() as i64;
+        let applied = after - before;
+        self.pending_scroll_delta = (i64::from(self.pending_scroll_delta) + applied)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+            as i32;
+    }
+
+    pub fn scroll_focused_to_bottom(&mut self) {
+        let Some(pane) = self.panes.get_mut(&self.focused) else {
+            return;
+        };
+        let before = pane.terminal.scrollback() as i64;
+        pane.terminal.scroll_to_bottom();
+        let after = pane.terminal.scrollback() as i64;
+        let applied = after - before;
+        self.pending_scroll_delta = (i64::from(self.pending_scroll_delta) + applied)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+            as i32;
+        pane.clear_unread();
+    }
+
+    pub fn take_pending_scroll_delta(&mut self) -> i32 {
+        std::mem::take(&mut self.pending_scroll_delta)
     }
 
     pub fn focused_pane_mut(&mut self) -> Option<&mut Pane> {
@@ -512,6 +567,50 @@ mod tests {
         session.adjust_ratio(5).unwrap();
         session.close_focused().unwrap();
         assert!(!session.rendered_rows.contains_key(&2));
+    }
+
+    #[test]
+    fn explicit_scroll_accumulates_viewport_delta() {
+        let (events, _) = mpsc::sync_channel(128);
+        let mut session = Session::new_with_command(
+            "scroll-delta".to_string(),
+            1,
+            &Config::default(),
+            4,
+            40,
+            SessionOptions {
+                command: None,
+                temporary: false,
+            },
+            events,
+        )
+        .unwrap();
+        session
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .terminal
+            .process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+
+        session.scroll_focused(2);
+        assert_eq!(session.focused_scrollback(), 2);
+        assert_eq!(session.take_pending_scroll_delta(), 2);
+        assert_eq!(session.take_pending_scroll_delta(), 0);
+
+        session
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .terminal
+            .process(b"six\r\n");
+        assert_eq!(
+            session.take_pending_scroll_delta(),
+            0,
+            "background output must not be reported as an explicit viewport move"
+        );
+
+        session.scroll_focused_to_bottom();
+        assert_eq!(session.take_pending_scroll_delta(), -3);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use plux::protocol::{read_message, write_message, ClientMessage, ServerMessage};
+use plux::protocol::{read_message, write_message, ClientMessage, CopyMode, ServerMessage};
 use vt100::Parser;
 
 static DAEMON_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -208,6 +208,70 @@ fn osc52_copy_from_pane_reaches_attached_client() {
         }
     }
     panic!("OSC 52 copy was not forwarded");
+}
+
+#[test]
+fn copy_request_includes_selection_above_the_viewport() {
+    let test = TestDaemon::start();
+    test.create_with_command(
+        "history-copy",
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "i=0; while [ $i -lt 40 ]; do printf 'copy-line-%02d\\r\\n' \"$i\"; i=$((i+1)); done; sleep 30"
+                .to_string(),
+        ],
+    );
+
+    let (mut attached, initial_snapshot) = test.attach_with_snapshot("history-copy");
+    attached
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut latest_snapshot = initial_snapshot;
+    let mut saw_latest = false;
+    for _ in 0..20 {
+        let mut screen = Parser::new(24, 80, 0);
+        screen.process(latest_snapshot.as_bytes());
+        if screen.screen().contents().contains("copy-line-39") {
+            assert!(!screen.screen().contents().contains("copy-line-00"));
+            saw_latest = true;
+            break;
+        }
+        match next_server(&mut attached) {
+            ServerMessage::Snapshot { data, .. } => {
+                latest_snapshot.push_str(&data);
+            }
+            response => panic!("expected output snapshot, got {response:?}"),
+        }
+    }
+    assert!(
+        saw_latest,
+        "latest output did not reach the attached client"
+    );
+
+    write_message(
+        &mut attached,
+        &ClientMessage::Copy {
+            start_row: -100,
+            start_col: 0,
+            end_row: 23,
+            end_col: 80,
+            mode: CopyMode::Character,
+        },
+    )
+    .unwrap();
+    for _ in 0..20 {
+        match next_server(&mut attached) {
+            ServerMessage::Copied { text } => {
+                assert!(text.contains("copy-line-00"));
+                assert!(text.contains("copy-line-39"));
+                return;
+            }
+            ServerMessage::Snapshot { .. } => {}
+            response => panic!("expected copied history, got {response:?}"),
+        }
+    }
+    panic!("copy response did not arrive");
 }
 
 #[test]
@@ -1415,11 +1479,18 @@ fn scroll_snapshot_replays_full_pty_history() {
 
     write_message(&mut attached, &ClientMessage::ScrollToTop).unwrap();
     let mut saw_first = false;
+    let mut saw_scroll_metadata = false;
     for _ in 0..5 {
         match read_message(&mut attached) {
-            Ok(Some(ServerMessage::Snapshot { data, .. })) => {
+            Ok(Some(ServerMessage::Snapshot {
+                data,
+                scrollback,
+                scroll_delta,
+                ..
+            })) => {
                 if data.contains("history-line-000") {
                     saw_first = true;
+                    saw_scroll_metadata = scrollback > 0 && scroll_delta > 0;
                     break;
                 }
             }
@@ -1438,6 +1509,10 @@ fn scroll_snapshot_replays_full_pty_history() {
     assert!(
         saw_first,
         "scroll-to-top snapshot did not contain old history"
+    );
+    assert!(
+        saw_scroll_metadata,
+        "scroll-to-top snapshot did not report the explicit viewport movement"
     );
 
     write_message(&mut attached, &ClientMessage::ScrollToBottom).unwrap();

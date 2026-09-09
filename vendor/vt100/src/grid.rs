@@ -205,6 +205,28 @@ impl Grid {
         self.visible_rows().nth(usize::from(row))
     }
 
+    pub fn relative_row(&self, row: i32) -> Option<&crate::row::Row> {
+        let visible_start = self.scrollback.len().saturating_sub(self.scrollback_offset);
+        let index = i64::try_from(visible_start).ok()? + i64::from(row);
+        let index = usize::try_from(index).ok()?;
+        if index < self.scrollback.len() {
+            self.scrollback.get(index)
+        } else {
+            self.rows.get(index - self.scrollback.len())
+        }
+    }
+
+    pub fn relative_row_bounds(&self) -> (i32, i32) {
+        let visible_start = self.scrollback.len().saturating_sub(self.scrollback_offset);
+        let total_rows = self.scrollback.len().saturating_add(self.rows.len());
+        let first = i32::try_from(visible_start)
+            .unwrap_or(i32::MAX)
+            .saturating_neg();
+        let last = i32::try_from(total_rows.saturating_sub(visible_start).saturating_sub(1))
+            .unwrap_or(i32::MAX);
+        (first, last)
+    }
+
     pub fn drawing_row(&self, row: u16) -> Option<&crate::row::Row> {
         self.drawing_rows().nth(usize::from(row))
     }

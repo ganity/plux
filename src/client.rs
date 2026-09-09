@@ -31,6 +31,15 @@ use crate::{
 
 const MOUSE_SCROLL_LINES: i32 = 3;
 const MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+/// Minimum drag distance (cells) before a mouse press starts a text selection.
+///
+/// Without this threshold, a click with a small mouse jitter crossing one cell
+/// boundary is treated as a drag and immediately puts the client into its
+/// select/scroll mode, which is surprising when the user just wants to interact
+/// with a pane or the status bar.
+const SELECTION_DRAG_THRESHOLD: u16 = 2;
+const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(20);
+const CLIENT_EVENT_TICK_INTERVAL: Duration = Duration::from_millis(10);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const CLIENT_INPUT_CAPACITY: usize = 256;
 const CLIENT_SERVER_CAPACITY: usize = 8;
@@ -165,6 +174,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
     let mut last_heartbeat_sent = Instant::now();
     let mut last_heartbeat_ack = Instant::now();
     let mut consecutive_input_events = 0;
+    let mut next_client_tick = Instant::now() + CLIENT_EVENT_TICK_INTERVAL;
     let mut paste_detector = PasteDetector::default();
     // ponytail: buffer user-owned input only for one cancellable, idle-timed upload.
     let mut pending_clipboard_input = Vec::new();
@@ -352,6 +362,7 @@ pub fn enter(config: &Config, name: String, ssh_target: Option<&str>) -> Result<
                 &input_events_rx,
                 &server_events_rx,
                 &mut consecutive_input_events,
+                &mut next_client_tick,
             ),
         };
         match event {
@@ -750,15 +761,26 @@ fn handle_server_message(
             mouse_enabled,
             alternate_screen,
             scrollback_available,
+            scrollback,
+            scroll_delta,
         } => {
+            let previous_selection = input.selection_coordinates_if_active();
             input.set_size(rows, cols);
             input.set_mouse_enabled(mouse_enabled);
             input.set_alternate_screen(alternate_screen);
             input.set_scrollback_available(scrollback_available);
+            input.apply_viewport_scroll_delta(scroll_delta);
+            if scrollback == 0 && input.autoscroll_edge == Some(AutoscrollEdge::Bottom) {
+                input.clear_autoscroll();
+            }
             view.set_size(rows, cols);
             view.process(&data);
             stdout.write_all(data.as_bytes())?;
-            view.redraw_selection(stdout, None, input.selection_coordinates_if_active())?;
+            view.redraw_selection(
+                stdout,
+                previous_selection,
+                input.selection_coordinates_if_active(),
+            )?;
             stdout.flush()?;
             draw_input_status(
                 stdout,
@@ -859,6 +881,7 @@ fn draw_input_status(
     }
     if status.is_none() {
         let row = input.rows.saturating_sub(1);
+        let row = i32::from(row);
         view.redraw_selection(stdout, Some((row, 0, row, input.cols)), None)?;
         input.status_drawn = false;
         return Ok(());
@@ -1219,7 +1242,13 @@ fn receive_client_event(
     input_events: &mpsc::Receiver<ClientEvent>,
     server_events: &mpsc::Receiver<ClientEvent>,
     consecutive_input_events: &mut usize,
+    next_tick: &mut Instant,
 ) -> std::result::Result<ClientEvent, mpsc::RecvTimeoutError> {
+    let now = Instant::now();
+    if now >= *next_tick {
+        *next_tick = now + CLIENT_EVENT_TICK_INTERVAL;
+        return Err(mpsc::RecvTimeoutError::Timeout);
+    }
     if *consecutive_input_events >= MAX_CONSECUTIVE_INPUT_EVENTS {
         match server_events.try_recv() {
             Ok(event) => {
@@ -1244,9 +1273,24 @@ fn receive_client_event(
         Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvTimeoutError::Disconnected),
         Err(mpsc::TryRecvError::Empty) => {}
     }
-    let event = server_events.recv_timeout(Duration::from_millis(10))?;
-    *consecutive_input_events = 0;
-    Ok(event)
+    match server_events.recv_timeout(
+        next_tick
+            .saturating_duration_since(Instant::now())
+            .min(CLIENT_EVENT_TICK_INTERVAL),
+    ) {
+        Ok(event) => {
+            *consecutive_input_events = 0;
+            Ok(event)
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let now = Instant::now();
+            if now >= *next_tick {
+                *next_tick = now + CLIENT_EVENT_TICK_INTERVAL;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn spawn_server_reader<R: Read + Send + 'static>(
@@ -1420,12 +1464,23 @@ struct InputState {
     scrollback_available: bool,
     rows: u16,
     cols: u16,
-    cursor_row: u16,
+    cursor_row: i32,
     cursor_col: u16,
-    selection_anchor: Option<(u16, u16)>,
+    selection_anchor: Option<(i32, u16)>,
     selection_mode: CopyMode,
     mouse_selecting: bool,
+    drag_start_row: u16,
+    drag_start_col: u16,
+    autoscroll_edge: Option<AutoscrollEdge>,
+    autoscroll_started: Option<Instant>,
+    autoscroll_pending: bool,
     status_drawn: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutoscrollEdge {
+    Top,
+    Bottom,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1449,7 +1504,7 @@ fn push_forward(actions: &mut Vec<InputAction>, bytes: &[u8]) {
     }
 }
 
-type Selection = (u16, u16, u16, u16);
+type Selection = (i32, u16, i32, u16);
 
 struct TerminalView {
     parser: vt100::Parser,
@@ -1539,19 +1594,23 @@ fn selection_row_range(
     current: Option<Selection>,
     rows: u16,
 ) -> Option<(u16, u16)> {
-    let mut range: Option<(u16, u16)> = None;
+    let last_screen_row = i32::from(rows.saturating_sub(1));
+    let mut range: Option<(i32, i32)> = None;
     for selection in [previous, current].into_iter().flatten() {
-        let first = selection.0.min(rows.saturating_sub(1));
-        let last = selection.2.min(rows.saturating_sub(1));
+        let first = selection.0.min(selection.2);
+        let last = selection.0.max(selection.2);
         range = Some(match range {
             Some((range_first, range_last)) => (range_first.min(first), range_last.max(last)),
             None => (first, last),
         });
     }
-    range
+    let (first, last) = range?;
+    (last >= 0 && first <= last_screen_row)
+        .then_some((first.max(0) as u16, last.min(last_screen_row) as u16))
 }
 
 fn selection_columns(selection: Option<Selection>, row: u16, cols: u16) -> Option<(u16, u16)> {
+    let row = i32::from(row);
     let (start_row, start_col, end_row, end_col) = selection?;
     if row < start_row || row > end_row {
         return None;
@@ -1576,11 +1635,16 @@ impl InputState {
             scrollback_available: true,
             rows,
             cols,
-            cursor_row: rows.saturating_sub(1),
+            cursor_row: i32::from(rows.saturating_sub(1)),
             cursor_col: 0,
             selection_anchor: None,
             selection_mode: CopyMode::Character,
             mouse_selecting: false,
+            drag_start_row: rows.saturating_sub(1),
+            drag_start_col: 0,
+            autoscroll_edge: None,
+            autoscroll_started: None,
+            autoscroll_pending: false,
             status_drawn: false,
         }
     }
@@ -1588,14 +1652,16 @@ impl InputState {
     fn set_size(&mut self, rows: u16, cols: u16) {
         self.rows = rows;
         self.cols = cols;
-        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        if self.selection_anchor.is_none() {
+            self.cursor_row = self.cursor_row.clamp(0, i32::from(rows.saturating_sub(1)));
+        }
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
-        if self
-            .selection_anchor
-            .is_some_and(|(row, col)| row >= rows || col >= cols)
-        {
+        self.drag_start_row = self.drag_start_row.min(rows.saturating_sub(1));
+        self.drag_start_col = self.drag_start_col.min(cols.saturating_sub(1));
+        if self.selection_anchor.is_some_and(|(_, col)| col >= cols) {
             self.selection_anchor = None;
             self.mouse_selecting = false;
+            self.clear_autoscroll();
         }
     }
 
@@ -1609,10 +1675,64 @@ impl InputState {
 
     fn set_scrollback_available(&mut self, available: bool) {
         self.scrollback_available = available;
+        if !available {
+            self.clear_autoscroll();
+        }
     }
 
     fn selection_coordinates_if_active(&self) -> Option<Selection> {
         self.selection_anchor.map(|_| self.selection_coordinates())
+    }
+
+    fn apply_viewport_scroll_delta(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        if self.autoscroll_pending {
+            self.autoscroll_pending = false;
+            self.autoscroll_started = Some(Instant::now());
+        }
+        if let Some((row, _)) = self.selection_anchor.as_mut() {
+            if self.autoscroll_edge.is_some() {
+                *row = row.saturating_add(delta);
+            } else {
+                *row = row.saturating_add(delta);
+                self.cursor_row = self.cursor_row.saturating_add(delta);
+            }
+        }
+    }
+
+    fn clear_autoscroll(&mut self) {
+        self.autoscroll_edge = None;
+        self.autoscroll_started = None;
+        self.autoscroll_pending = false;
+    }
+
+    fn update_autoscroll(&mut self, row: u16, actions: &mut Vec<InputAction>) {
+        if self.alternate_screen || !self.scrollback_available {
+            self.clear_autoscroll();
+            return;
+        }
+        let edge = if row == 0 {
+            Some(AutoscrollEdge::Top)
+        } else if row == self.rows.saturating_sub(1) {
+            Some(AutoscrollEdge::Bottom)
+        } else {
+            None
+        };
+        if edge != self.autoscroll_edge {
+            self.autoscroll_edge = edge;
+            self.autoscroll_started = edge.map(|_| Instant::now());
+            if let Some(edge) = edge {
+                self.autoscroll_pending = true;
+                actions.push(InputAction::Message(ClientMessage::Scroll {
+                    rows: match edge {
+                        AutoscrollEdge::Top => 1,
+                        AutoscrollEdge::Bottom => -1,
+                    },
+                }));
+            }
+        }
     }
 
     fn status_text(&self) -> Option<String> {
@@ -1622,7 +1742,9 @@ impl InputState {
             InputMode::Scroll if self.selection_anchor.is_some() => Some(format!(
                 "select {:?}: {},{}",
                 self.selection_mode,
-                self.cursor_row + 1,
+                self.cursor_row
+                    .clamp(0, i32::from(self.rows.saturating_sub(1)))
+                    + 1,
                 self.cursor_col + 1
             )),
             InputMode::Scroll => Some("scroll: k/Up PgUp | j/Down PgDn | q".into()),
@@ -1783,17 +1905,30 @@ impl InputState {
         let row = row.min(self.rows.saturating_sub(1));
         let col = col.min(self.cols.saturating_sub(1));
         if self.mouse_selecting {
-            let moved = (row, col) != (self.cursor_row, self.cursor_col);
-            if self.selection_anchor.is_none() && (code & 32 != 0 || release && moved) {
-                let anchor = (self.cursor_row, self.cursor_col);
-                self.enter_scroll_mode();
-                self.selection_anchor = Some(anchor);
-                self.selection_mode = CopyMode::Character;
+            // A drag only starts a selection once the pointer has actually moved
+            // to a different cell while the button is held (a motion report), and
+            // that movement is far enough from the press position. A plain click
+            // whose press and release land on adjacent cells (tiny mouse jitter)
+            // must not put the client into select/scroll mode.
+            if self.selection_anchor.is_none() && code & 32 != 0 {
+                let drag_distance = i32::from(row)
+                    .abs_diff(i32::from(self.drag_start_row))
+                    .max(i32::from(col).abs_diff(i32::from(self.drag_start_col)));
+                if drag_distance >= SELECTION_DRAG_THRESHOLD.into() {
+                    let anchor = (self.drag_start_row, self.drag_start_col);
+                    self.enter_scroll_mode();
+                    self.selection_anchor = Some((i32::from(anchor.0), anchor.1));
+                    self.selection_mode = CopyMode::Character;
+                }
             }
-            self.cursor_row = row;
+            self.cursor_row = i32::from(row);
             self.cursor_col = col;
+            if self.selection_anchor.is_some() && code & 32 != 0 {
+                self.update_autoscroll(row, actions);
+            }
             if release {
                 self.mouse_selecting = false;
+                self.clear_autoscroll();
                 if self.selection_anchor.is_none() {
                     return true;
                 }
@@ -1810,10 +1945,12 @@ impl InputState {
         }
         if !release && code & 3 == 0 && code & 32 == 0 {
             if self.mode == InputMode::Scroll {
-                self.selection_anchor = Some((row, col));
+                self.selection_anchor = Some((i32::from(row), col));
                 self.selection_mode = CopyMode::Character;
             }
-            self.cursor_row = row;
+            self.drag_start_row = row;
+            self.drag_start_col = col;
+            self.cursor_row = i32::from(row);
             self.cursor_col = col;
             self.mouse_selecting = true;
             return true;
@@ -1825,8 +1962,11 @@ impl InputState {
         self.mode = InputMode::Scroll;
         self.selection_anchor = None;
         self.selection_mode = CopyMode::Character;
-        self.cursor_row = self.rows.saturating_sub(1);
+        self.drag_start_row = self.rows.saturating_sub(1);
+        self.drag_start_col = 0;
+        self.cursor_row = i32::from(self.rows.saturating_sub(1));
         self.cursor_col = 0;
+        self.clear_autoscroll();
     }
 
     fn exit_scroll_mode(&mut self) {
@@ -1834,6 +1974,7 @@ impl InputState {
         self.selection_anchor = None;
         self.selection_mode = CopyMode::Character;
         self.mouse_selecting = false;
+        self.clear_autoscroll();
     }
 
     fn feed_byte(&mut self, byte: u8, actions: &mut Vec<InputAction>) {
@@ -1942,10 +2083,10 @@ impl InputState {
                 self.cursor_row = self
                     .cursor_row
                     .saturating_add(1)
-                    .min(self.rows.saturating_sub(1));
+                    .clamp(0, i32::from(self.rows.saturating_sub(1)));
             }
             b'k' if self.selection_anchor.is_some() => {
-                self.cursor_row = self.cursor_row.saturating_sub(1);
+                self.cursor_row = self.cursor_row.saturating_sub(1).max(0);
             }
             b'j' => actions.push(InputAction::Message(ClientMessage::Scroll { rows: -1 })),
             b'k' => actions.push(InputAction::Message(ClientMessage::Scroll { rows: 1 })),
@@ -2012,9 +2153,9 @@ impl InputState {
         }
     }
 
-    fn selection_coordinates(&self) -> (u16, u16, u16, u16) {
+    fn selection_coordinates(&self) -> Selection {
         let Some((anchor_row, anchor_col)) = self.selection_anchor else {
-            return (0, 0, self.rows.saturating_sub(1), self.cols);
+            return (0, 0, i32::from(self.rows.saturating_sub(1)), self.cols);
         };
         if matches!(self.selection_mode, CopyMode::Line) {
             return (
@@ -2042,6 +2183,24 @@ impl InputState {
     }
 
     fn tick(&mut self) -> Option<InputAction> {
+        if self.mouse_selecting
+            && self.selection_anchor.is_some()
+            && !self.autoscroll_pending
+            && self
+                .autoscroll_started
+                .is_some_and(|started| started.elapsed() >= SELECTION_AUTOSCROLL_INTERVAL)
+        {
+            self.autoscroll_started = Some(Instant::now());
+            self.autoscroll_pending = true;
+            return self.autoscroll_edge.map(|edge| {
+                InputAction::Message(ClientMessage::Scroll {
+                    rows: match edge {
+                        AutoscrollEdge::Top => 1,
+                        AutoscrollEdge::Bottom => -1,
+                    },
+                })
+            });
+        }
         if self
             .escape_started
             .is_some_and(|started| started.elapsed() > Duration::from_millis(50))
@@ -2267,11 +2426,15 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::net::UnixStream, sync::mpsc, time::Duration};
+    use std::{
+        os::unix::net::UnixStream,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
 
     use super::{
-        draw_input_status, spawn_server_reader, ClientEvent, InputAction, InputState,
-        PasteDetector, PasteEvent, TerminalView, MOUSE_CAPTURE_ENABLE,
+        draw_input_status, handle_server_message, spawn_server_reader, ClientEvent, ClipboardUi,
+        InputAction, InputState, PasteDetector, PasteEvent, TerminalView, MOUSE_CAPTURE_ENABLE,
     };
     use crate::{
         config::Config,
@@ -2506,6 +2669,8 @@ mod tests {
                     mouse_enabled: false,
                     alternate_screen: false,
                     scrollback_available: true,
+                    scrollback: 0,
+                    scroll_delta: 0,
                 },
             })
             .unwrap();
@@ -2513,10 +2678,40 @@ mod tests {
             .send(ClientEvent::Input(b"mouse-motion".to_vec()))
             .unwrap();
         let mut consecutive_input_events = 0;
+        let mut next_tick = Instant::now() + Duration::from_secs(1);
 
         assert!(matches!(
-            super::receive_client_event(&input_rx, &server_rx, &mut consecutive_input_events),
+            super::receive_client_event(
+                &input_rx,
+                &server_rx,
+                &mut consecutive_input_events,
+                &mut next_tick,
+            ),
             Ok(ClientEvent::Input(bytes)) if bytes == b"mouse-motion"
+        ));
+    }
+
+    #[test]
+    fn due_client_tick_is_not_starved_by_pending_server_events() {
+        let (_input_tx, input_rx) = mpsc::sync_channel(1);
+        let (server_tx, server_rx) = mpsc::sync_channel(1);
+        server_tx
+            .send(ClientEvent::Server {
+                generation: 1,
+                message: ServerMessage::HeartbeatAck,
+            })
+            .unwrap();
+        let mut consecutive_input_events = 0;
+        let mut next_tick = Instant::now() - Duration::from_millis(1);
+
+        assert!(matches!(
+            super::receive_client_event(
+                &input_rx,
+                &server_rx,
+                &mut consecutive_input_events,
+                &mut next_tick,
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout)
         ));
     }
 
@@ -2535,20 +2730,33 @@ mod tests {
                         mouse_enabled: false,
                         alternate_screen: false,
                         scrollback_available: true,
+                        scrollback: 0,
+                        scroll_delta: 0,
                     },
                 })
                 .unwrap();
         }
         let mut consecutive_input_events = 0;
+        let mut next_tick = Instant::now() + Duration::from_secs(1);
         assert!(matches!(
-            super::receive_client_event(&input_rx, &server_rx, &mut consecutive_input_events),
+            super::receive_client_event(
+                &input_rx,
+                &server_rx,
+                &mut consecutive_input_events,
+                &mut next_tick,
+            ),
             Ok(ClientEvent::Server {
                 message: ServerMessage::Snapshot { data, .. },
                 ..
             }) if data == "old"
         ));
         assert!(matches!(
-            super::receive_client_event(&input_rx, &server_rx, &mut consecutive_input_events),
+            super::receive_client_event(
+                &input_rx,
+                &server_rx,
+                &mut consecutive_input_events,
+                &mut next_tick,
+            ),
             Ok(ClientEvent::Server {
                 message: ServerMessage::Snapshot { data, .. },
                 ..
@@ -2570,8 +2778,14 @@ mod tests {
             })
             .unwrap();
         let mut consecutive_input_events = 8;
+        let mut next_tick = Instant::now() + Duration::from_secs(1);
         assert!(matches!(
-            super::receive_client_event(&input_rx, &server_rx, &mut consecutive_input_events),
+            super::receive_client_event(
+                &input_rx,
+                &server_rx,
+                &mut consecutive_input_events,
+                &mut next_tick,
+            ),
             Ok(ClientEvent::Server {
                 message: ServerMessage::HeartbeatAck,
                 ..
@@ -2745,11 +2959,203 @@ mod tests {
     }
 
     #[test]
+    fn selection_follows_mouse_scrollback() {
+        let mut state = InputState::new(24, 80, 0);
+        assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
+        assert!(state.feed(b"\x1b[<32;6;2M").is_empty());
+        assert!(!state.feed(b"\x1b[<0;6;2m").is_empty());
+        assert_eq!(state.selection_coordinates_if_active(), Some((1, 2, 1, 6)));
+
+        let actions = state.feed(b"\x1b[<64;10;5M");
+        assert!(matches!(
+            actions.as_slice(),
+            [InputAction::Message(ClientMessage::Scroll { rows: 3 })]
+        ));
+        state.apply_viewport_scroll_delta(3);
+        assert_eq!(
+            state.selection_coordinates_if_active(),
+            Some((4, 2, 4, 6)),
+            "selection must follow the selected content when the viewport moves"
+        );
+    }
+
+    #[test]
+    fn dragging_to_bottom_edge_requests_autoscroll_and_repeats() {
+        let mut state = InputState::new(4, 20, 0);
+        assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
+        let actions = state.feed(b"\x1b[<32;6;4M");
+        assert!(matches!(
+            actions.as_slice(),
+            [InputAction::Message(ClientMessage::Scroll { rows: -1 })]
+        ));
+        std::thread::sleep(Duration::from_millis(35));
+        assert!(state.tick().is_none(), "滚动快照返回前不能堆积请求");
+        state.apply_viewport_scroll_delta(-1);
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(matches!(
+            state.tick(),
+            Some(InputAction::Message(ClientMessage::Scroll { rows: -1 }))
+        ));
+    }
+
+    #[test]
+    fn dragging_to_top_edge_requests_history_scroll() {
+        let mut state = InputState::new(4, 20, 0);
+        assert!(state.feed(b"\x1b[<0;3;3M").is_empty());
+        let actions = state.feed(b"\x1b[<32;6;1M");
+        assert!(matches!(
+            actions.as_slice(),
+            [InputAction::Message(ClientMessage::Scroll { rows: 1 })]
+        ));
+    }
+
+    #[test]
+    fn autoscroll_keeps_endpoint_at_edge_when_snapshot_moves_viewport() {
+        let mut state = InputState::new(4, 20, 0);
+        assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
+        assert!(state.feed(b"\x1b[<32;6;4M").iter().any(|action| matches!(
+            action,
+            InputAction::Message(ClientMessage::Scroll { rows: -1 })
+        )));
+
+        state.apply_viewport_scroll_delta(-1);
+        assert_eq!(state.selection_coordinates_if_active(), Some((0, 2, 3, 6)));
+    }
+
+    #[test]
+    fn mouse_copy_keeps_selection_rows_above_the_viewport() {
+        let mut state = InputState::new(4, 20, 0);
+        assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
+        assert!(state.feed(b"\x1b[<32;6;4M").iter().any(|action| matches!(
+            action,
+            InputAction::Message(ClientMessage::Scroll { rows: -1 })
+        )));
+        state.apply_viewport_scroll_delta(-2);
+
+        let actions = state.feed(b"\x1b[<0;6;4m");
+        assert!(matches!(
+            actions.as_slice(),
+            [InputAction::Message(ClientMessage::Copy {
+                start_row: -1,
+                start_col: 2,
+                end_row: 3,
+                end_col: 6,
+                mode: crate::protocol::CopyMode::Character,
+            })]
+        ));
+    }
+
+    #[test]
+    fn leaving_screen_edge_stops_autoscroll_repeats() {
+        let mut state = InputState::new(4, 20, 0);
+        assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
+        assert!(state.feed(b"\x1b[<32;6;4M").iter().any(|action| matches!(
+            action,
+            InputAction::Message(ClientMessage::Scroll { rows: -1 })
+        )));
+        assert!(state.feed(b"\x1b[<32;6;3M").is_empty());
+        std::thread::sleep(Duration::from_millis(35));
+        assert!(state.tick().is_none());
+    }
+
+    #[test]
+    fn snapshot_scroll_metadata_moves_selection_and_keeps_it_when_offscreen() {
+        let mut input = InputState::new(4, 20, 0);
+        assert!(input.feed(b"\x1b[<0;3;2M").is_empty());
+        assert!(input.feed(b"\x1b[<32;6;2M").is_empty());
+        assert!(!input.feed(b"\x1b[<0;6;2m").is_empty());
+
+        let mut view = TerminalView::new(4, 20);
+        let mut rendered = Vec::new();
+        handle_server_message(
+            &Config::default(),
+            &mut input,
+            &mut view,
+            &mut rendered,
+            "test",
+            ClipboardUi {
+                activity: None,
+                queued: 0,
+            },
+            ServerMessage::Snapshot {
+                rows: 4,
+                cols: 20,
+                data: String::new(),
+                mouse_enabled: false,
+                alternate_screen: false,
+                scrollback_available: true,
+                scrollback: 3,
+                scroll_delta: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(input.selection_coordinates_if_active(), Some((4, 2, 4, 6)));
+        assert!(!rendered.is_empty());
+
+        input.apply_viewport_scroll_delta(-10);
+        let mut clipped = Vec::new();
+        view.redraw_selection(
+            &mut clipped,
+            Some((4, 2, 4, 6)),
+            input.selection_coordinates_if_active(),
+        )
+        .unwrap();
+        assert!(
+            !clipped
+                .windows(b"\x1b[7m".len())
+                .any(|window| window == b"\x1b[7m"),
+            "fully offscreen selections should not draw an inverse overlay"
+        );
+        assert_eq!(
+            input.selection_coordinates_if_active(),
+            Some((-6, 2, -6, 6))
+        );
+    }
+
+    #[test]
     fn mouse_click_does_not_enter_selection() {
         let mut state = InputState::new(24, 80, 0);
 
         assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
         assert!(state.feed(b"\x1b[<0;3;2m").is_empty());
+        assert!(matches!(state.mode, super::InputMode::Normal));
+        assert!(state.selection_anchor.is_none());
+        assert!(!state.mouse_selecting);
+    }
+
+    #[test]
+    fn mouse_jitter_within_drag_threshold_does_not_enter_selection() {
+        let mut state = InputState::new(24, 80, 0);
+
+        // Press at (col=3,row=2) and release one cell away; a single-cell jitter
+        // during a click must not put the client into select/scroll mode.
+        assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
+        assert!(state.feed(b"\x1b[<0;4;2m").is_empty());
+        assert!(matches!(state.mode, super::InputMode::Normal));
+        assert!(state.selection_anchor.is_none());
+        assert!(!state.mouse_selecting);
+
+        // The same applies to a drag-motion event that moves only one cell.
+        assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
+        assert!(state.feed(b"\x1b[<32;4;2M").is_empty());
+        assert!(matches!(state.mode, super::InputMode::Normal));
+        assert!(state.selection_anchor.is_none());
+        assert!(state.feed(b"\x1b[<0;4;2m").is_empty());
+        assert!(matches!(state.mode, super::InputMode::Normal));
+        assert!(state.selection_anchor.is_none());
+        assert!(!state.mouse_selecting);
+    }
+
+    #[test]
+    fn mouse_release_on_adjacent_cell_after_plain_click_stays_normal() {
+        let mut state = InputState::new(24, 80, 0);
+
+        // A click whose press and release land on adjacent cells (for example a
+        // fast click with a small hand movement) must not enter select mode even
+        // when the terminal reports no intermediate motion event.
+        assert!(state.feed(b"\x1b[<0;3;2M").is_empty());
+        assert!(state.feed(b"\x1b[<0;6;2m").is_empty());
         assert!(matches!(state.mode, super::InputMode::Normal));
         assert!(state.selection_anchor.is_none());
         assert!(!state.mouse_selecting);
